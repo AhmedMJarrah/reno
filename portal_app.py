@@ -1,5 +1,5 @@
 """
-portal_app.py — v1.3.0  (project: reno, volunteer portal, phase 1)
+portal_app.py — v1.3.1  (project: reno, volunteer portal, phase 1)
 One Streamlit app, role-based: volunteers (v1..v5) see only their own tasks; the admin sees progress,
 reassigns tasks and reads the answers. Backend: Google Sheets through sheets_store.py.
 
@@ -14,6 +14,11 @@ visible white background + border on every writable text box (previously transpa
 editable field looked identical to the page behind it); the amendment-text panel in the reflection
 form is now open by default and each target article shows the matching amendment clause inline
 instead of a single detached reference block; gazette number/page/date no longer share one line.
+
+v1.3.1 — "previous" vs "current" in the reflection form is now a word-level diff (difflib), not two
+plain read-only boxes: text removed since the previous version shows struck-through in red on the
+"previous" side, text added shows highlighted in green on the "current" side, exactly like a
+track-changes view. Everything unchanged between the two stays plain text.
 
 
 Run locally (CMD):   streamlit run portal_app.py
@@ -43,7 +48,9 @@ name (see LOGIN_ALIASES below) — no need to remember "v1"/"v2".
 """
 from __future__ import annotations
 
+import difflib
 import hmac
+import html
 import json
 import os
 import re
@@ -55,7 +62,7 @@ import streamlit as st
 from guides import guide
 from sheets_store import STATUSES, Store
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 QUEUES = {"reflection": "الانعكاسات", "end_date": "تاريخ انتهاء السريان",
           "number_year": "رقم وسنة التشريع", "articles": "المواد الناقصة"}
 QUEUE_ICONS = {"reflection": "🔄", "end_date": "📅", "number_year": "🔢", "articles": "📄"}
@@ -308,6 +315,40 @@ def ro(label: str, text: str, key: str, h: int = 220):
     st.text_area(label, text or "— لا يوجد نص —", height=h, disabled=True, key=key)
 
 
+def diff_spans(prev_text: str, curr_text: str) -> tuple[str, str]:
+    """Word-level diff between two article texts (stdlib difflib — no new dependency).
+    Returns (prev_html, curr_html): removed text struck through in red on the "previous" side,
+    added text highlighted in green on the "current" side; unchanged text is left plain."""
+    tok = lambda s: re.findall(r"\s+|\S+", s or "")
+    a, b = tok(prev_text), tok(curr_text)
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    prev_html, curr_html = [], []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        pa, pb = html.escape("".join(a[i1:i2])), html.escape("".join(b[j1:j2]))
+        if op == "equal":
+            prev_html.append(pa)
+            curr_html.append(pb)
+        else:
+            if pa:
+                prev_html.append(f'<span style="background:#fde2e2;color:#a3282f;text-decoration:line-through">{pa}</span>')
+            if pb:
+                curr_html.append(f'<span style="background:#dcf7e3;color:#0f6b3a;font-weight:700">{pb}</span>')
+    return "".join(prev_html), "".join(curr_html)
+
+
+def ro_html(label: str, content_html: str, h: int = 220):
+    """Same look as ro() (a bordered, read-only, gray box) but renders diff-highlighted HTML instead
+    of plain text — a real <textarea> can't color individual words, so this is a styled div.
+    NOTE: the opening <div ...> tag must stay on a single line — Streamlit's markdown renderer only
+    reliably treats it as raw HTML when the tag isn't split across a newline; verified by testing a
+    split-tag version, which silently failed to render as HTML (confirmed live, not assumed)."""
+    st.caption(label)
+    body = content_html if content_html.strip() else "— لا يوجد نص —"
+    style = (f"background:#eef2f6;border:1.5px solid #c7d7e6;border-radius:8px;padding:10px 12px;"
+             f"height:{h}px;overflow-y:auto;white-space:pre-wrap;line-height:1.85;font-size:1rem;color:#334155")
+    st.markdown(f'<div style="{style}">{body}</div>', unsafe_allow_html=True)
+
+
 def prefill(task_id: str) -> dict:
     la = latest_answers()
     if len(la) and task_id in la.index:
@@ -349,6 +390,7 @@ def form_reflection(task, p, prev):
                         key=f"full_{task.task_id}", height=120)
     st.divider()
     st.markdown(f"🎯 **المواد المتأثرة بهذا التعديل: {n_targets}** — قارن «قبل / عندنا الآن» بنص التعديل أعلاه، واكتب الصحيح.")
+    st.caption("🟢 نص أضيف بالنسخة الحالية · 🔴 نص محذوف من النسخة السابقة")
     k_extra = f"extra_{task.task_id}"
     if k_extra not in st.session_state:
         st.session_state[k_extra] = [a for a in prev.get("articles", []) if a.get("added")]
@@ -363,11 +405,12 @@ def form_reflection(task, p, prev):
             hits = [x["text"] for x in amend if pat.search(x.get("text", ""))]
             if hits:
                 st.info("📌 ما يطلبه نص التعديل بخصوص هذه المادة: " + " — ".join(hits))
+            prev_diff, curr_diff = diff_spans(a["previous"], a["current"])
             c1, c2, c3 = st.columns(3)
             with c1:
-                ro("النسخة السابقة (قبل التعديل)", a["previous"], f"p_{task.task_id}_{i}")
+                ro_html("النسخة السابقة (قبل التعديل)", prev_diff)
             with c2:
-                ro("النسخة الحالية عندنا", a["current"], f"c_{task.task_id}_{i}")
+                ro_html("النسخة الحالية عندنا", curr_diff)
             with c3:
                 n = st.text_input("رقم المادة", saved.get(a["n"], {}).get("n", a["n"]), key=f"n_{task.task_id}_{i}") if a["added"] else a["n"]
                 txt = st.text_area("النص الصحيح (عدّل هنا)", saved.get(a["n"], {}).get("text", a["current"]), height=220,
