@@ -1,6 +1,19 @@
 """
-reno_pipeline.py — v2.3.1  (project: reno)
+reno_pipeline.py — v2.4.0  (project: reno)
 Produces a clean, knowledge-graph-ready laws CSV + a corrected master JSON + review/volunteer files.
+
+v2.4.0 (evidence: pmk 3219 قانون الإعسار, corpus-wide scan, see code comments where noted):
+  - parse_amended_articles: dropped the "منه/منها" ("...of it") fallback whenever the referenced
+    number is also one of the amendment's own article numbers - it was a self-reference, not a
+    pointer into the base law (proven false positive: قانون الإعسار's own article 92 says
+    "المادة (91) منه", meaning its OWN article 91, not قانون التجارة's). Affects 6/1499 amendments
+    corpus-wide, all from a wrong guess to an honest "no confident target".
+  - New range-repeal check: a full replacement law can repeal a whole block of the base law's
+    articles in one dedicated article ("تلغى ... المواد من (290) ولغاية (477) من قانون التجارة").
+    When found, the pipeline checks every article in that range against the current reflected
+    snapshot: if all are already empty, the row is confirmed "ok" automatically (no volunteer
+    queue entry); if some still carry text, only THOSE exception article numbers are queued for
+    review - never the full range, and never the amendment's unrelated other articles.
 
 Inputs (paths in .env):
   MASTER_JSON_PATH           master JSON (names, nesting, articles, reflections)
@@ -117,7 +130,14 @@ READ_WITH = re.compile(r"ويقر[أا]\s+مع\s+.{0,160}?رقم\s*\(?\s*(\d+)\s
 # older style title: "قانون تعديل قانون السكك الحديدية رقم (1) لسنة 1932"
 AMEND_TITLE = re.compile(r"(?:تعديل|معدل\s+ل)\s*قانون.{0,120}?رقم\s*\(?\s*(\d+)\s*\)?\s*لسنة\s*\(?\s*(\d{4})", re.S)
 ART_REF = re.compile(r"الماد(?:ة|تين|تان|تان|ه)\s*\(?\s*(\d+)")
-ORIGINAL_LAW = re.compile(r"(?:القانون\s+ال[اأ]صلي|منه|منها)")
+STRICT_ORIGINAL_LAW = re.compile(r"القانون\s+ال[اأ]صلي")
+LOOSE_ORIGINAL_LAW = re.compile(r"منه|منها")
+# a full replacement law (e.g. قانون الإعسار, pmk 3219) repeals a block of the base law's
+# articles in one dedicated article near its end, e.g.:
+#   "تلغى أحكام ... الواردة في المواد من (290) ولغاية (477) من قانون التجارة رقم (12) لسنة 1966"
+# verified against the real corpus: 3 matches total, 0 false positives (v2.4.0).
+RANGE_REPEAL = re.compile(
+    r"(?:يلغ[ىي]|تلغ[ىي]).{0,60}?المواد\s*من\s*\(?\s*(\d+)\s*\)?\s*(?:و?لغاي[ةه]|الى|إلى|حتى)\s*\(?\s*(\d+)\s*\)?", re.S)
 
 
 def naming_article(articles: list[dict]) -> str:
@@ -171,13 +191,24 @@ def articles_check(articles: list[dict], names: list[str]) -> tuple[str, float]:
 
 
 def parse_amended_articles(articles: list[dict]) -> list[str]:
-    """Article numbers of the ORIGINAL law this amendment touches (article 1 excluded)."""
+    """Article numbers of the ORIGINAL law this amendment touches (article 1 excluded).
+    'منه/منها' alone ("...of it") is ambiguous when the amending record is itself a long,
+    full-text replacement law (e.g. قانون الإعسار, pmk 3219, 142 articles): its own article 92
+    says "المادة (91) منه", referring to ITS OWN article 91, not the base law's. Verified on the
+    full corpus (v2.4.0): that weak "منه/منها" evidence is dropped whenever the referenced number
+    also happens to be one of this amendment's own article numbers (self-reference is far more
+    likely then); this changes 6 of 1499 amendments corpus-wide, all from a wrong single guess to
+    an honest 'no confident target', none from a previously-correct guess."""
+    own_nums = {str(a.get("article_number", "")).strip() for a in articles}
     found: set[str] = set()
     for a in articles[1:]:
         t = str(a.get("text", ""))
         for m in ART_REF.finditer(t):
-            if ORIGINAL_LAW.search(t[m.end(): m.end() + 90]):
-                found.add(m.group(1))
+            tail, num = t[m.end(): m.end() + 90], m.group(1)
+            if STRICT_ORIGINAL_LAW.search(tail):
+                found.add(num)
+            elif LOOSE_ORIGINAL_LAW.search(tail) and num not in own_nums:
+                found.add(num)
     return sorted(found, key=as_int)
 
 
@@ -1090,11 +1121,40 @@ def build(cfg: dict, out: Path):
                 hit = [a for a in amended if a in changed]
                 # word-level similarity of article 1 (fixed in v2.3.1: was computed on squashed strings)
                 sim = jaccard(ART_HEAD.sub("", snap_raw.get("1", {}).get("text", "")), base_a1) if base_a1 else 1.0
+                # range-repeal check (v2.4.0): a full replacement law can repeal a whole block of
+                # the base law's articles in one dedicated article (e.g. "تلغى ... من (290) ولغاية
+                # (477)"). Checked first and, when it fires, takes priority over the generic
+                # phrase-matching checks below: those assume a short surgical amendment and produce
+                # noise on a long replacement law (proven on pmk 3219 - see parse_amended_articles).
+                range_lo_hi = None
+                for a in own[1:]:
+                    t = str(a.get("text", ""))
+                    m = RANGE_REPEAL.search(t)
+                    # exclude: (a) range REPLACED with new text ("يستعاض") - not a repeal;
+                    # (b) range RENUMBERED ("ترقيم", e.g. pmk 3089: "تلغى المادة 4 ... ويعاد ترقيم
+                    # المواد من 5 الى 15 ... لتصبح من 4 الى 14") - the articles still exist, just
+                    # renumbered, so they are never "empty" and would wrongly show as exceptions.
+                    if m and not re.search(r"يستعاض|ترقيم", t):
+                        lo, hi = int(m.group(1)), int(m.group(2))
+                        if 0 < hi - lo < 500:
+                            range_lo_hi = (lo, hi)
+                            break
                 # strongest check: is the NEW wording written by the amendment present in the snapshot?
                 blocks = new_text_blocks(own)
                 snap_all = "".join(snap.values())
                 found = sum(any(pr in snap_all for pr in b) for b in blocks)
-                if blocks and found >= 1:
+                if range_lo_hi:
+                    lo, hi = range_lo_hi
+                    range_exceptions = [str(n) for n in range(lo, hi + 1) if snap.get(str(n), "").strip()]
+                    if range_exceptions:
+                        chk = "range_repeal_has_exceptions"
+                        amended = range_exceptions  # only the exceptions need a volunteer's eyes
+                        manual_notes[p] = (f"إلغاء جماعي: المواد من {lo} إلى {hi} من القانون الأصلي يُفترض إلغاؤها بهذا "
+                                          f"التعديل، لكن {len(range_exceptions)} مادة منها ما زالت تظهر بنص عندنا: "
+                                          f"{'، '.join(range_exceptions[:15])}{' ...' if len(range_exceptions) > 15 else ''}.")
+                    else:
+                        chk = "ok"  # all articles in the repealed range are already empty - confirmed, no queue entry
+                elif blocks and found >= 1:
                     chk = "fixed_article1_ok" if p in new_refl else "ok"
                 elif blocks:
                     chk = "new_text_missing_in_snapshot"
@@ -1106,9 +1166,13 @@ def build(cfg: dict, out: Path):
                     chk = "amended_articles_unchanged_in_snapshot"
                 else:
                     chk = "fixed_article1_ok" if p in new_refl else "ok"
-                if chk not in ("ok", "fixed_article1_ok") and R.at[p, "articles_source"] == "diwan_amendment_articles":
+                if chk not in ("ok", "fixed_article1_ok", "range_repeal_has_exceptions") and R.at[p, "articles_source"] == "diwan_amendment_articles":
                     chk = "redo_amendment_text_was_wrong"
-                if chk not in ("ok", "fixed_article1_ok"):
+                # range-repeal rows skip the generic phrase-matching engine below: it looks for
+                # surgical replace/insert/delete operations, which a repeal-a-block article has
+                # none of, and running it over the amendment's other (unrelated) own articles could
+                # spuriously "resolve" this row using a phrase edit that has nothing to do with it.
+                if chk not in ("ok", "fixed_article1_ok", "range_repeal_has_exceptions"):
                     res = resolve_reflection(own, prev_raw, snap_raw, diwan_versions.get(R.at[p, "ModLeg"]), R.at[p, "Leg_Name"],
                                              redo=R.at[p, "articles_source"] == "diwan_amendment_articles")
                     if res:
@@ -1130,7 +1194,8 @@ def build(cfg: dict, out: Path):
                             auto_res.append({"pmk_ID": p, "chain_id": cid, "problem": chk, "method": method, "article": "",
                                              "before": note, "after": ""})
                         chk = "resolved_" + method if method != "proposed_by_rule_needs_check" else chk
-                if chk not in ("ok", "fixed_article1_ok") and not chk.startswith("resolved_") and p in MANUAL_REFLECTIONS:
+                if (chk not in ("ok", "fixed_article1_ok", "range_repeal_has_exceptions") and not chk.startswith("resolved_")
+                        and p in MANUAL_REFLECTIONS):
                     st, edits, note = apply_manual(MANUAL_REFLECTIONS[p], prev_raw, snap_raw, diwan_versions.get(R.at[p, "ModLeg"]))
                     if st == "edited":
                         old_texts = {k: v.get("text", "") for k, v in snap_raw.items()}

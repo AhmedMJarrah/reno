@@ -1,13 +1,25 @@
 """
-portal_app.py — v1.1.0  (project: reno, volunteer portal, phase 1)
+portal_app.py — v1.3.0  (project: reno, volunteer portal, phase 1)
 One Streamlit app, role-based: volunteers (v1..v5) see only their own tasks; the admin sees progress,
 reassigns tasks and reads the answers. Backend: Google Sheets through sheets_store.py.
 
+v1.3.0 — fixed a real bug, not just a cosmetic tweak: the v1.2.0 "pill" CSS for st.radio
+(hover/selected feedback, colored backgrounds) targeted `div[role="radiogroup"] > label`, which
+never matched anything. Streamlit 1.64 renders each radio option as a <label data-testid=
+"stRadioOption"> that is a GRANDCHILD of the radiogroup (there's a wrapper div in between), and
+marks the picked option with `data-selected="true"` rather than a plain :checked input — confirmed
+by launching the app locally against a fake store and inspecting the real DOM with Playwright, not
+guessed. Same pass added: interactive feedback on checkboxes/tabs/expanders/download button; a
+visible white background + border on every writable text box (previously transparent, so an
+editable field looked identical to the page behind it); the amendment-text panel in the reflection
+form is now open by default and each target article shows the matching amendment clause inline
+instead of a single detached reference block; gazette number/page/date no longer share one line.
+
+
 Run locally (CMD):   streamlit run portal_app.py
 
-Theme (put next to this file, as .streamlit/config.toml — see chat for the exact content):
-    [theme] base="light", primaryColor sky-blue, light backgrounds. Without it Streamlit falls
-    back to its default (dark on some browsers) theme and the custom CSS below has to fight it.
+Theme: .streamlit/config.toml next to this file (see chat for the exact content — v1.2.0 changed
+backgroundColor to a light tint, not pure white).
 
 Secrets (.streamlit/secrets.toml locally, "Secrets" on Streamlit Cloud):
 
@@ -34,6 +46,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 from datetime import date, datetime
 
 import pandas as pd
@@ -42,7 +55,7 @@ import streamlit as st
 from guides import guide
 from sheets_store import STATUSES, Store
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 QUEUES = {"reflection": "الانعكاسات", "end_date": "تاريخ انتهاء السريان",
           "number_year": "رقم وسنة التشريع", "articles": "المواد الناقصة"}
 QUEUE_ICONS = {"reflection": "🔄", "end_date": "📅", "number_year": "🔢", "articles": "📄"}
@@ -50,7 +63,8 @@ PROBLEMS = {"new_text_missing_in_snapshot": "النص الجديد الذي جا
             "identical_to_previous_version": "النسخة الحالية مطابقة للنسخة السابقة رغم وجود تعديل",
             "amended_articles_unchanged_in_snapshot": "المواد التي يذكرها التعديل لم تتغير في النسخة الحالية",
             "snapshot_may_belong_to_other_law": "النسخة الحالية قد تكون نص قانون آخر",
-            "redo_amendment_text_was_wrong": "نص التعديل كان خطأ واستُبدل من الديوان؛ يلزم إعادة الانعكاس"}
+            "redo_amendment_text_was_wrong": "نص التعديل كان خطأ واستُبدل من الديوان؛ يلزم إعادة الانعكاس",
+            "range_repeal_has_exceptions": "التعديل يلغي مجموعة مواد دفعة واحدة، وبعضها ما زال يظهر بنص عندنا"}
 V_REFL = {"ok": "الانعكاس سليم", "fixed": "صححت النص", "undecided": "لا أستطيع الحسم"}
 V_END = {"dated": "غير ساري – حددت تاريخ انتهاء السريان", "active": "التشريع ساري فعلاً (الحالة خطأ)", "undecided": "لا أستطيع الحسم"}
 V_ROW = {"correct": "صحيح", "wrong": "خطأ – أكتب الصحيح", "duplicate": "مكرر لسجل آخر في المجموعة", "undecided": "لا أستطيع الحسم"}
@@ -58,10 +72,31 @@ V_ART = {"entered": "أدخلت المواد", "no_text": "لا توجد موا�
 VERDICT_AR = {**V_REFL, **V_END, **V_ROW, **V_ART, "answered": "تمت الإجابة"}
 KIND_AR = {"final": "نهائية", "draft": "مسودة"}
 STATUS_STYLE = {"pending": ("#eef2f7", "#64748b"), "in_progress": ("#fff4e5", "#b45309"), "done": ("#e8f8ef", "#15803d")}
-ART_COLORS = ["#2f8fd6", "#059669", "#7c3aed", "#d97706"]
+ART_COLORS = ["#2f8fd6", "#059669", "#7c3aed", "#d97706"]      # badge (solid)
+ART_BG = ["#eaf5fd", "#e8f8f0", "#f1ebfc", "#fdf3e5"]          # matching card tint (light)
 
 # the two lead reviewers can log in with their own name instead of v1/v2
 LOGIN_ALIASES = {"نلا": "v1", "نولا": "v1", "نوله": "v1", "لين": "v2", "لينا": "v2"}
+
+LOGIN_ILLUSTRATION = """
+<svg viewBox="0 0 300 200" width="260" height="173" role="img" aria-label="مراجعة تشريع">
+  <circle cx="150" cy="100" r="95" fill="#eaf4fc"/>
+  <circle cx="218" cy="52" r="28" fill="#f1ebfc"/>
+  <circle cx="66" cy="152" r="20" fill="#fdf3e5"/>
+  <rect x="95" y="38" width="100" height="132" rx="12" fill="#ffffff" stroke="#d7e6f2" stroke-width="2"/>
+  <path d="M173 38 L195 38 L195 60 Z" fill="#eaf4fc" stroke="#d7e6f2" stroke-width="2" stroke-linejoin="round"/>
+  <rect x="110" y="56" width="50" height="8" rx="4" fill="#2f8fd6"/>
+  <rect x="110" y="76" width="70" height="6" rx="3" fill="#cfe3f3"/>
+  <rect x="110" y="90" width="70" height="6" rx="3" fill="#cfe3f3"/>
+  <rect x="110" y="104" width="55" height="6" rx="3" fill="#cfe3f3"/>
+  <rect x="110" y="118" width="70" height="6" rx="3" fill="#cfe3f3"/>
+  <rect x="110" y="132" width="40" height="6" rx="3" fill="#cfe3f3"/>
+  <circle cx="188" cy="158" r="27" fill="#059669" stroke="#ffffff" stroke-width="5"/>
+  <path d="M176 158 L185 167 L201 149" stroke="#ffffff" stroke-width="5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="242" cy="128" r="4" fill="#2f8fd6" opacity=".5"/>
+  <circle cx="58" cy="58" r="5" fill="#7c3aed" opacity=".4"/>
+  <circle cx="248" cy="168" r="3" fill="#d97706" opacity=".5"/>
+</svg>"""
 
 st.set_page_config(page_title="بوابة تدقيق التشريعات", page_icon="⚖️", layout="wide")
 st.markdown("""
@@ -79,6 +114,10 @@ html { font-size: 17px; }
 .stMarkdown p, .stMarkdown li { font-size: 1.05rem; line-height: 1.95; }
 h1, h2, h3, h4 { font-weight: 700; }
 
+/* -------- login hero: force centering regardless of the RTL rule above -------- */
+.login-hero { text-align: center; padding: 1.6rem 0 1.2rem; }
+.login-hero h1, .login-hero p, .login-hero div { text-align: center !important; }
+
 /* -------- sidebar -------- */
 section[data-testid="stSidebar"] {
     direction: rtl;
@@ -86,22 +125,73 @@ section[data-testid="stSidebar"] {
     border-left: 1px solid #d7e9f7;
 }
 
-/* pill-style radio (category picker) */
-div[role="radiogroup"] > label {
-    background: #ffffff; border: 1px solid #d7e6f2; border-radius: 12px;
-    padding: 10px 14px; margin-bottom: 8px; width: 100%; transition: all .15s ease;
+/* pill-style radio (category picker + every "answer" radio in the forms).
+   Streamlit 1.64 renders each option as <label data-testid="stRadioOption">, which is a
+   GRANDCHILD of [role=radiogroup] (there's a wrapper div in between) — a plain "> label" child
+   selector never matches it. The picked option carries data-selected="true"; there is no reliable
+   :checked to key off. Verified against the real rendered DOM, not assumed. */
+label[data-testid="stRadioOption"] {
+    background: #ffffff; border: 1.5px solid #d7e6f2; border-radius: 12px;
+    padding: 10px 16px; margin-bottom: 6px; cursor: pointer;
+    transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease, background .12s ease, opacity .12s ease;
 }
-div[role="radiogroup"] > label:hover { border-color: #2f8fd6; }
-div[role="radiogroup"] > label:has(input:checked) { background: #2f8fd6 !important; border-color: #2f8fd6; }
-div[role="radiogroup"] > label:has(input:checked) p { color: #ffffff !important; font-weight: 700; }
+label[data-testid="stRadioOption"]:hover { border-color: #2f8fd6; transform: scale(1.02); box-shadow: 0 2px 10px rgba(47,143,214,.18); }
+label[data-testid="stRadioOption"]:active { transform: scale(.96); }
+label[data-testid="stRadioOption"][data-selected="true"] {
+    background: #2f8fd6 !important; border-color: #2f8fd6; transform: scale(1.04);
+    box-shadow: 0 4px 14px rgba(47,143,214,.32);
+}
+label[data-testid="stRadioOption"][data-selected="true"] p { color: #ffffff !important; font-weight: 700; }
+/* once one option is picked, the others visibly step back — this is the "تصغر شوي" effect */
+div[data-testid="stRadioGroup"]:has(label[data-selected="true"]) label[data-testid="stRadioOption"]:not([data-selected="true"]) {
+    transform: scale(.95); opacity: .82;
+}
+/* sidebar category picker: full width, bigger icon + label */
+section[data-testid="stSidebar"] label[data-testid="stRadioOption"] { width: 100%; }
+section[data-testid="stSidebar"] label[data-testid="stRadioOption"] p { font-size: 1.12rem; margin: 0; }
+
+/* checkboxes: same hover/press feel as everything else */
+div[data-testid="stCheckbox"] label { cursor: pointer; transition: transform .12s ease; }
+div[data-testid="stCheckbox"] label:hover { transform: scale(1.03); }
+div[data-testid="stCheckbox"] label:active { transform: scale(.97); }
+
+/* expanders + tabs: visible hover, bigger label */
+[data-testid="stExpander"] summary { border-radius: 10px; transition: background .12s ease; cursor: pointer; }
+[data-testid="stExpander"] summary:hover { background: #eaf4fc; }
+[data-testid="stExpander"] summary p { font-size: 1.05rem; }
+.stTabs [data-testid="stTab"] { transition: transform .12s ease, background .12s ease; border-radius: 8px 8px 0 0; }
+.stTabs [data-testid="stTab"]:hover { background: #eaf4fc; }
+.stTabs [data-testid="stTab"] p { font-size: 1.03rem; }
 
 /* -------- chips / badges (atomic labels only — safe under RTL) -------- */
 .chip { display: inline-block; padding: 4px 14px; border-radius: 999px; font-size: .85rem; font-weight: 700; }
 .abadge { display: inline-block; padding: 4px 14px; border-radius: 999px; font-size: .92rem;
           font-weight: 700; color: #fff; margin-bottom: .5rem; }
 
-/* -------- buttons / containers -------- */
-.stButton > button, .stFormSubmitButton > button { border-radius: 10px; font-weight: 600; }
+/* -------- buttons: visible press/hover feedback -------- */
+.stButton > button, .stFormSubmitButton > button, .stDownloadButton > button {
+    border-radius: 10px; font-weight: 600; transition: transform .12s ease, box-shadow .12s ease;
+}
+.stButton > button:hover, .stFormSubmitButton > button:hover, .stDownloadButton > button:hover {
+    transform: scale(1.035); box-shadow: 0 4px 14px rgba(47,143,214,.28);
+}
+.stButton > button:active, .stFormSubmitButton > button:active, .stDownloadButton > button:active { transform: scale(.96); }
+
+/* -------- inputs: must always read as "a box you write in" — never the same color as what's behind them.
+   White + a clear border while editable; a muted gray while disabled (read-only reference fields
+   like "النسخة السابقة/الحالية"), so the two are visually distinct at a glance. -------- */
+.stTextArea textarea, .stTextInput input {
+    background: #ffffff !important; border: 1.5px solid #c7d7e6 !important; border-radius: 8px !important;
+    transition: border-color .12s ease, box-shadow .12s ease;
+}
+.stTextArea textarea:disabled, .stTextInput input:disabled {
+    background: #eef2f6 !important; color: #51667a !important; opacity: 1 !important; -webkit-text-fill-color: #51667a;
+}
+.stTextArea textarea:focus, .stTextInput input:focus {
+    border-color: #2f8fd6 !important; box-shadow: 0 0 0 3px rgba(47,143,214,.15) !important;
+}
+
+/* -------- containers (cards) -------- */
 div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px !important; }
 [data-testid="stMetricValue"] { font-size: 1.5rem; }
 </style>""", unsafe_allow_html=True)
@@ -138,8 +228,8 @@ def links() -> dict:
 
 # ============================================================================ login
 def login():
-    st.markdown("""<div style='text-align:center;padding:2.2rem 0 1.2rem'>
-<div style='font-size:3rem'>⚖️</div>
+    st.markdown(f"""<div class='login-hero'>
+{LOGIN_ILLUSTRATION}
 <h1 style='margin:.3rem 0'>بوابة تدقيق التشريعات</h1>
 <p style='color:#5b7387'>مشروع reno — مراجعة بيانات التشريعات الأردنية</p></div>""", unsafe_allow_html=True)
     users = load(store(), "users")
@@ -148,7 +238,7 @@ def login():
     with mid:
         with st.form("login"):
             st.markdown("#### تسجيل الدخول")
-            raw = st.text_input("اسمك", placeholder="مثال: نلا")
+            raw = st.text_input("اسمك")
             p = st.text_input("كلمة السر", type="password")
             ok = st.form_submit_button("دخول", type="primary", width="stretch")
         if ok:
@@ -186,16 +276,28 @@ def article_badge(n, i: int, extra: str = ""):
     st.markdown(f"<span class='abadge' style='background:{color}'>المادة {n}{extra}</span>", unsafe_allow_html=True)
 
 
+def tint_box(key: str, i: int = 0):
+    """A bordered container with a light, non-white background (cycles ART_BG by i). Use with `with`."""
+    bg = ART_BG[i % len(ART_BG)]
+    st.markdown(f"<style>.st-key-{key} {{ background:{bg} !important; border-radius:14px; }}</style>", unsafe_allow_html=True)
+    return st.container(border=True, key=key)
+
+
 def card(p: dict, extra: str = ""):
     g = p.get("gazette", {})
-    with st.container(border=True):
+    st.markdown("<style>.st-key-metacard { background:#f2f8fd !important; border-radius:14px; }</style>", unsafe_allow_html=True)
+    with st.container(border=True, key="metacard"):
         st.markdown(f"##### {p.get('name', '')}")
         st.caption(p.get("type", ""))
         c1, c2, c3 = st.columns(3)
         c1.metric("الرقم", p.get("number") or "—")
         c2.metric("السنة", p.get("year") or "—")
         c3.metric("الحالة", p.get("status") or "—")
-        st.markdown(f"**الجريدة الرسمية:** العدد {g.get('number') or '—'} · صفحة {g.get('page') or '—'} · بتاريخ {g.get('date') or '—'}")
+        st.caption("الجريدة الرسمية")
+        g1, g2, g3 = st.columns(3)
+        g1.markdown(f"**العدد**  \n{g.get('number') or '—'}")
+        g2.markdown(f"**الصفحة**  \n{g.get('page') or '—'}")
+        g3.markdown(f"**التاريخ**  \n{g.get('date') or '—'}")
         if p.get("base_name"):
             st.markdown(f"**القانون الأصلي:** {p['base_name']}")
         if extra:
@@ -236,12 +338,17 @@ def form_reflection(task, p, prev):
     if p.get("reviewer_note"):
         st.warning(f"ملاحظة المراجع: {p['reviewer_note']}")
     st.caption(f"سبب وصول المهمة: {PROBLEMS.get(p.get('problem'), p.get('problem'))} — ترتيب التعديل في السلسلة: {p.get('position_in_chain')}")
-    with st.expander("📜 نص التعديل كما نُشر", expanded=True):
-        for i, a in enumerate(p.get("amendment_articles", [])):
-            article_badge(a["n"], i)
+    amend = p.get("amendment_articles", [])
+    n_targets = len(p.get("articles", []))
+    with st.expander(f"📜 نص التعديل نفسه كما نُشر في الجريدة ({len(amend)} مادة)", expanded=True):
+        st.caption("هذا نص التعديل — أي التعليمات التي تطلب التغيير — وليس نص القانون الأصلي. قارنه بالمواد أدناه.")
+        for i, a in enumerate(amend):
+            article_badge(a["n"], i, " من نص التعديل")
             st.write(a["text"])
     full = st.text_area("نص التعديل الكامل من الجريدة (فقط إذا كان النص أعلاه ناقصاً)", prev.get("full_amendment_text", ""),
                         key=f"full_{task.task_id}", height=120)
+    st.divider()
+    st.markdown(f"🎯 **المواد المتأثرة بهذا التعديل: {n_targets}** — قارن «قبل / عندنا الآن» بنص التعديل أعلاه، واكتب الصحيح.")
     k_extra = f"extra_{task.task_id}"
     if k_extra not in st.session_state:
         st.session_state[k_extra] = [a for a in prev.get("articles", []) if a.get("added")]
@@ -250,8 +357,12 @@ def form_reflection(task, p, prev):
     saved = {a["n"]: a for a in prev.get("articles", [])}
     out = []
     for i, a in enumerate(arts):
-        with st.container(border=True):
+        with tint_box(f"art_{task.task_id}_{i}", i):
             article_badge(a["n"], i, " (مادة مضافة)" if a["added"] else "")
+            pat = re.compile(rf"الماد(?:ة|تين|تان|ه)\s*\(?\s*{re.escape(str(a['n']))}\s*\)?")
+            hits = [x["text"] for x in amend if pat.search(x.get("text", ""))]
+            if hits:
+                st.info("📌 ما يطلبه نص التعديل بخصوص هذه المادة: " + " — ".join(hits))
             c1, c2, c3 = st.columns(3)
             with c1:
                 ro("النسخة السابقة (قبل التعديل)", a["previous"], f"p_{task.task_id}_{i}")
@@ -332,16 +443,19 @@ def form_number_year(task, p, prev):
     st.info(f"**{p.get('kind_ar', '')}** — كل السجلات أدناه مسجلة برقم **{p.get('number')}** لسنة **{p.get('year')}**.")
     rows, saved, out = p.get("rows", []), prev.get("rows", {}), {}
     labels = {r["pmk_ID"]: f"{r['pmk_ID']} — {r['name']}" for r in rows}
-    for r in rows:
+    for i, r in enumerate(rows):
         pid, sv = r["pmk_ID"], saved.get(r["pmk_ID"], {})
         g = r["gazette"]
-        with st.container(border=True):
+        with tint_box(f"nyr_{task.task_id}_{i}", i):
             st.markdown(f"**{r['name']}**")
             st.caption(f"{r['type']} · المعرّف {pid}")
+            g1, g2, g3 = st.columns(3)
+            g1.caption(f"📰 عدد الجريدة: {g.get('number') or '—'}")
+            g2.caption(f"📄 الصفحة: {g.get('page') or '—'}")
+            g3.caption(f"📅 التاريخ: {g.get('date') or '—'}")
             c1, c2 = st.columns(2)
-            c1.markdown(f"**الجريدة:** العدد {g.get('number') or '—'} · صفحة {g.get('page') or '—'} · بتاريخ {g.get('date') or '—'}")
-            c2.markdown(f"**في الديوان:** {r.get('diwan_number') or '—'} / {r.get('diwan_year') or '—'}"
-                        f" &nbsp;·&nbsp; **سنة العنوان:** {r.get('own_title_year') or '—'}", unsafe_allow_html=True)
+            c1.markdown(f"**في الديوان:** {r.get('diwan_number') or '—'} / {r.get('diwan_year') or '—'}")
+            c2.markdown(f"**سنة العنوان:** {r.get('own_title_year') or '—'}")
             if r.get("base_name"):
                 st.markdown(f"**يعدّل:** {r['base_name']}")
             c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
@@ -384,7 +498,7 @@ def form_articles(task, p, prev):
     if verdict == "entered":
         st.caption(f"عدد المواد المدخلة: {len(arts)}. انسخ النص كما هو دون «المادة (…)» في أوله.")
         for i, a in enumerate(arts):
-            with st.container(border=True):
+            with tint_box(f"artq_{task.task_id}_{i}", i):
                 article_badge(a["n"] or "؟", i)
                 c1, c2, c3 = st.columns([1, 6, 0.6])
                 a["n"] = c1.text_input("رقم المادة", a["n"], key=f"an_{task.task_id}_{i}")
@@ -436,8 +550,7 @@ def volunteer():
 <div style='width:56px;height:56px;border-radius:50%;background:#2f8fd6;color:#fff;
 display:flex;align-items:center;justify-content:center;font-size:1.4rem;font-weight:700;margin:0 auto .5rem'>
 {(st.session_state.name or '?')[:1]}</div>
-<div style='font-weight:700;font-size:1.1rem'>{st.session_state.name}</div>
-<div style='color:#5b7387;font-size:.85rem'>متطوع مراجعة</div></div>""", unsafe_allow_html=True)
+<div style='font-weight:700;font-size:1.1rem'>{st.session_state.name}</div></div>""", unsafe_allow_html=True)
         qs = [q for q in QUEUES if q in set(mine.queue)]
         if not qs:
             st.info("لا توجد مهمات مخصصة لك حالياً.")
@@ -471,19 +584,29 @@ display:flex;align-items:center;justify-content:center;font-size:1.4rem;font-wei
         view = m[["task_id", "title", "status", "updated_at"]].assign(status=m.status.map(STATUSES))
         st.dataframe(view.rename(columns={"task_id": "المهمة", "title": "التشريع", "status": "الحالة", "updated_at": "آخر تحديث"}),
                      hide_index=True, width="stretch")
-        pick = st.selectbox("افتح مهمة", m.task_id.tolist(), key=f"pick_{q}")
-        if st.button("فتح", key=f"open_{q}"):
-            st.session_state[f"cur_{q}"] = pick
-            st.rerun()
     with t_task:
+        all_ids = m.task_id.tolist()
+        if not all_ids:
+            st.info("لا توجد مهمات في هذه الفئة.")
+            return
         cur = st.session_state.get(f"cur_{q}")
-        if not cur:
+        if not cur or cur not in all_ids:
             nxt = pd.concat([m[m.status == "in_progress"], m[m.status == "pending"]])
             if not len(nxt):
                 st.balloons()
-                st.success("أنهيت كل مهماتك في هذه الفئة. شكراً لك! يمكنك مراجعة إجاباتك من «مهماتي».")
-                return
-            cur = nxt.task_id.iloc[0]
+                st.success("أنهيت كل مهماتك في هذه الفئة. شكراً لك! يمكنك مراجعة إجاباتك من «مهماتي»، أو تصفّحها من القائمة أدناه.")
+                cur = None
+            else:
+                cur = nxt.task_id.iloc[0]
+                st.session_state[f"cur_{q}"] = cur
+        titles = m.set_index("task_id").title.to_dict()
+        nav = st.selectbox("🔀 التنقل بين القوانين", all_ids, index=all_ids.index(cur) if cur in all_ids else 0,
+                           format_func=lambda tid: f"{titles.get(tid, '')}  ·  {tid}", key=f"nav_{q}")
+        if nav != cur:
+            st.session_state[f"cur_{q}"] = nav
+            st.rerun()
+        if not cur:
+            return
         task = m[m.task_id == cur].iloc[0]
         p = s.payload(task)
         st.subheader(f"{task.task_id} — {task.title}")

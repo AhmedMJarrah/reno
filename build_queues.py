@@ -1,6 +1,10 @@
 """
-build_queues.py — v1.0.0  (project: reno, volunteer portal, phase 1)
+build_queues.py — v1.1.0  (project: reno, volunteer portal, phase 1)
 Turns the reno outputs into self-contained volunteer tasks, split between the volunteers.
+
+v1.1.0: task_id is now a stable hash of (queue, pmk_ID), not a running counter - see the comment
+above the task_id line for why (a rerun that removes/reorders one row used to reassign every
+later task_id in that queue to a different law).
 
 Phase-1 queues (priority order):
   reflection      الانعكاسات                 -> only the users in REFLECTION_USERS (e.g. v1,v2)
@@ -20,6 +24,7 @@ Output: outputs\\queues_<timestamp>\\tasks.csv  (+ summary in logs\\)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -28,7 +33,7 @@ from pathlib import Path
 
 import pandas as pd
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 log = logging.getLogger("build_queues")
 MAX_FIELD = 60000  # per text field
@@ -158,8 +163,20 @@ def build(run: Path, users: list[str], refl_users: list[str], out: Path) -> pd.D
         tasks.append({"queue": "articles", "pmk_ID": r.pmk_ID, "title": r.Leg_Name, "payload": meta(r.pmk_ID)})
 
     # ---- ids + assignment ------------------------------------------------------------------------
+    # task_id is derived from (queue, pmk_ID) via a short stable hash - NOT a running counter.
+    # v1.1.0 fix: the old "REF-0001, REF-0002, ..." scheme numbered tasks by their ROW POSITION in
+    # that run's CSV. Any pipeline rerun that adds/removes/reorders even ONE row (e.g. the range-
+    # repeal fix removing pmk 3219 from the reflection queue) silently shifts every task_id after it
+    # onto a DIFFERENT law - verified: after that single removal, all 23 remaining reflection
+    # task_ids pointed to a different law than before. Since seed_sheets.py --add matches by
+    # task_id, that would either silently skip real updates or, with --force, wipe volunteers'
+    # existing answers. A hash of the stable pmk_ID is reproducible across reruns regardless of
+    # what else changed elsewhere in the same queue.
     T = pd.DataFrame(tasks)
-    T["task_id"] = [f"{qn[:3].upper()}-{i + 1:04d}" for qn, i in zip(T.queue, T.groupby("queue").cumcount())]
+    T["task_id"] = [f"{qn[:3].upper()}-{hashlib.md5(pid.encode()).hexdigest()[:6]}" for qn, pid in zip(T.queue, T.pmk_ID)]
+    dupe = T[T.duplicated("task_id", keep=False)]
+    if len(dupe):
+        raise ValueError(f"task_id hash collision, widen the hash:\n{dupe[['queue', 'pmk_ID', 'task_id']]}")
     T["assigned_to"] = ""
     for qn, g in T.groupby("queue"):
         who = refl_users if qn == "reflection" else users
