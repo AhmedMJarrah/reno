@@ -1,0 +1,8 @@
+numpy==2.4.6
+pandas==3.0.6
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.3
+six==1.17.0
+tzdata==2026.4
+gspread>=6
+streamlit>=1.40
