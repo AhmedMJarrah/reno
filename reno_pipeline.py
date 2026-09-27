@@ -1,7 +1,23 @@
 """
-reno_pipeline.py — v2.6.1  (project: reno)
+reno_pipeline.py — v2.7.0  (project: reno)
 Produces a clean, knowledge-graph-ready laws CSV + a corrected master JSON + review/volunteer files.
 
+v2.7.0 (evidence: content checks on the data below, 2026-09-27; full before/after diff against v2.6.1):
+  - Successor relations: a JSON Replaced_By / Canceled_By citing only laws OLDER than the record is withheld
+    (2 Replaced_By, 15 Canceled_By - e.g. 2003/2012 amendments "cancelled by" the 1965 Public Security Law);
+    listed in review_successor_relations_withheld_*.csv.
+  - Replaced_For review triage: items the evidence already settles are closed and no longer flagged - JSON copies
+    of Replaced_By citing newer laws (200), CSV "ألغي بـ" texts already recorded in Canceled_By (92), the same law
+    cited in different wording (2). 71 stay open for a person, with a suggestion where one applies
+    (candidate_predecessor 24, belongs_to_Canceled_By 11).
+  - Active_Date checked against the law's own naming article: "من تاريخ نشره" (+ a stated delay) or an explicit
+    date. Applied only where the current value plainly contradicts the text - before publication, the stated delay
+    ignored, or another explicit date not later than Year+1 (35 fixed, 18 filled). Measured agreement where both
+    exist: 97.6% overall, 247/258 for explicit dates, 228/241 for delayed rules. "From the original law's date"
+    wording is compared with the parent's Active_Date (review only). Remaining disagreements, dates long before
+    publication without such wording, and gazette dates over a year from Year go to
+    review_dates_checked_against_article1_*.csv. Runs after sequencing, so chains are unchanged.
+  - Volunteer queue files are byte-identical to v2.6.1 (no re-seeding needed).
 v2.6.1 (evidence: content audit of both Replaced_For sources + full before/after diff against v2.6.0, 2026-09-27):
   - Replaced_For = the OLDER law this record replaced. The JSON side is now checked too: a JSON value is
     withheld from the canonical output when it is identical to the record's own Replaced_By (a contradiction
@@ -77,6 +93,9 @@ Rules (decided with Ahmed):
   - Duplicates are removed only when content is verified (same ModLeg+gazette, or same law: year+gazette+name+text).
   - Article text proven to belong to another legislation is replaced from the Diwan when the Diwan text matches.
   - Reflection article 1 overwritten by the amendment's own naming article is restored from the previous version.
+  - Active_Date = what the law's own naming article says (publication date + stated delay, or an explicit date).
+  - Replaced_For names the OLDER law; Replaced_By / Canceled_By name a law of the same year or later. The CSV
+    Replaced_For column is evidence only (exception to "CSV beats JSON"); contradicting values are withheld.
   - Everything else goes to review/volunteer files — no guessing.
 
 Usage (CMD):  py reno_pipeline.py
@@ -89,7 +108,7 @@ import logging
 import os
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -99,7 +118,7 @@ try:
 except ImportError:  # pipeline still runs; those cases stay in the volunteer queue
     MANUAL_REFLECTIONS = {}
 
-VERSION = "2.6.1"
+VERSION = "2.7.0"
 TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 log = logging.getLogger("reno_pipeline")
 ISSUE_DATES: dict = {}
@@ -188,6 +207,95 @@ def replaced_for_json_problem(rf: str, rb: str, own_year: str) -> str:
     if cites(rf, own_year) == "newer_only":
         return "json_points_to_later_law"
     return ""
+
+
+# ----------------------------------------------------------------------------- review triage (v2.7.0)
+CITATION = re.compile(r"رقم\s*\(?\s*(\d+)\s*\)?\s*(?:لسنة|لسنه|/)\s*\(?\s*(\d{4})")
+CANCEL_PREFIX = re.compile(r"^\s*[أا]لغي\s*(?:بـ|ب\s|بموجب|بموحب)\s*[:：]?\s*[:：]?\s*")
+
+
+def citations(text: str) -> set:
+    """Law citations written 'رقم N لسنة YYYY' or 'رقم N/YYYY' (digits normalised)."""
+    return set(CITATION.findall(str(text or "").translate(AR_DIGITS)))
+
+
+def is_cancellation(text: str) -> bool:
+    return bool(CANCEL_PREFIX.match(str(text or "")))
+
+
+def repeats_canceled_by(csv_text: str, canceled_by: str) -> bool:
+    """A CSV 'ألغي بـ ...' text that only repeats what the JSON's Canceled_By already records."""
+    if not canceled_by or not is_cancellation(csv_text):
+        return False
+    body = CANCEL_PREFIX.sub("", str(csv_text))
+    cited = citations(body)
+    if cited:
+        return cited <= citations(canceled_by)
+    return bool(squash(body)) and squash(body) in squash(canceled_by)
+
+
+def triage_replaced_for(code: str, rf_json: str, rf_csv: str, canceled_by: str, own_year: str) -> str:
+    """Close the review items the evidence already settles; everything else stays open for a person."""
+    if code == "json_equals_replaced_by" and cites(rf_json, own_year) == "newer_only":
+        return "resolved_json_copy_of_replaced_by"  # a copy of the successor cannot name the predecessor
+    if code == "csv_conflicts_with_json" and citations(rf_json) and citations(rf_json) == citations(rf_csv):
+        return "resolved_same_law_different_wording"
+    if code in ("csv_only_unapproved", "csv_conflicts_with_json") and repeats_canceled_by(rf_csv, canceled_by):
+        return "resolved_csv_value_is_known_cancellation"
+    return code
+
+
+# ----------------------------------------------------------------------------- Active_Date from the law's own text (v2.7.0)
+# Rule (Ahmed, 2026-09-21): Active_Date is what the naming article says - "يعمل به من تاريخ نشره" = the gazette date,
+# "بعد مرور ثلاثين يوما على تاريخ نشره" = gazette + 30 days, or an explicit date. Measured on the v2.6.1 output: the
+# rule reproduces the current Active_Date within 3 days for 3397 of 3481 records that have both (97.6%).
+MONTHS = {"كانون الثاني": 1, "كانون ثاني": 1, "يناير": 1, "شباط": 2, "فبراير": 2, "اذار": 3, "مارس": 3, "نيسان": 4,
+          "ابريل": 4, "ايار": 5, "مايو": 5, "حزيران": 6, "يونيو": 6, "تموز": 7, "يوليو": 7, "اب": 8, "اغسطس": 8,
+          "ايلول": 9, "سبتمبر": 9, "تشرين الاول": 10, "تشرين اول": 10, "اكتوبر": 10, "تشرين الثاني": 11,
+          "تشرين ثاني": 11, "نوفمبر": 11, "كانون الاول": 12, "كانون اول": 12, "ديسمبر": 12}
+DAYS = {"ثلاثين": 30, "ستين": 60, "تسعين": 90, "خمسه عشر": 15, "اربعه عشر": 14, "عشره": 10, "سبعه": 7}
+WORK_FROM = re.compile(r"(?:يعمل (?:به|بهذا القانون|بهذا الذيل|باحكامه|باحكام هذا القانون)|"
+                       r"يعتبر(?: هذا القانون| هذا الذيل)? (?:نافذ|ساري) المفعول|يسري مفعوله|يعتبر معمولا به)")
+_FROM = r"^\s*(?:اعتبارا\s+|ابتداء\s+)?من\s+"
+PUB0 = re.compile(_FROM + r"تاريخ\s+نشره")
+PUBN = re.compile(r"^\s*(?:اعتبارا\s+من\s+|ابتداء\s+من\s+)?بعد\s+(?:مرور\s+|انقضاء\s+|انتهاء\s+)?(?:(\d+)|("
+                  + "|".join(sorted(DAYS, key=len, reverse=True)) + r"))\s*(?:يوما|يوم|ايام)\s+(?:علي|من)\s+تاريخ\s+نشره")
+NUM_DATE = re.compile(_FROM + r"(?:تاريخ\s+)?(\d{1,2})\s*[/\-]\s*(\d{1,2})\s*[/\-]\s*(\d{4})")
+MONTH_DATE = re.compile(_FROM + r"(?:تاريخ\s+)?(?:اول|الاول من|1)\s*(?:شهر\s*)?(" + "|".join(sorted(MONTHS, key=len, reverse=True))
+                        + r")\s*(?:سنه|عام|لسنه)?\s*(\d{4})")
+FROM_BASE = re.compile(_FROM + r"تاريخ\s+(?:العمل|نفاذ|سريان)\s+(?:ب|في\s+)?\s*(?:القانون\s+)?(?:الاصلي|المذكور)")
+RETRO = re.compile(_FROM + r"(?:بدايه|بدء|اول)\s+(?:السنه|الشهر)")
+
+
+def effective_rule(text: str):
+    """What the naming article says about entry into force, read right after "ويعمل به ...":
+    ('pub', days after publication) | ('date', 'YYYY-MM-DD') | ('base', 0) = from the original law's own date |
+    ('retro', 0) = from the start of a year/month (not computed) | None = not stated in a form we read."""
+    t = str(text or "").translate(AR_DIGITS)
+    t = re.sub(r"\s+", " ", AR_DIAC.sub("", re.sub("[إأآا]", "ا", t).replace("ى", "ي").replace("ة", "ه")))
+    m = WORK_FROM.search(t)
+    if not m:
+        return None
+    tail = t[m.end(): m.end() + 160]
+    if PUB0.search(tail):
+        return ("pub", 0)
+    k = PUBN.search(tail)
+    if k:
+        return ("pub", int(k.group(1)) if k.group(1) else DAYS[k.group(2)])
+    try:
+        d = NUM_DATE.search(tail)
+        if d:
+            return ("date", date(int(d.group(3)), int(d.group(2)), int(d.group(1))).isoformat())
+        d = MONTH_DATE.search(tail)
+        if d:
+            return ("date", date(int(d.group(2)), MONTHS[d.group(1)], 1).isoformat())
+    except ValueError:
+        return None
+    if FROM_BASE.search(tail):
+        return ("base", 0)
+    if RETRO.search(tail):
+        return ("retro", 0)
+    return None
 
 
 WRAPPER = re.compile(r"^\s*قانون\s+(?:مؤقت\s+)?(?:معدل\s+)?(?:مؤقت\s+)?رقم\s*\d+\s*لسنة\s*\d{4}\s*\((.+)\)\s*(وتعديلاته)?\s*$")
@@ -995,6 +1103,13 @@ def build(cfg: dict, out: Path):
         if active and end and end < active:
             flag(p, "end_before_active")
         rf_problem = replaced_for_json_problem(r.j_replaced_for, r.j_replaced_by, year)
+        # v2.7.0: a successor relation (Replaced_By / Canceled_By) cannot name a law OLDER than the record itself
+        rb_older = cites(r.j_replaced_by, year) == "older_only"
+        cb_older = cites(r.j_canceled_by, year) == "older_only"
+        if rb_older:
+            flag(p, "replaced_by_points_to_older_law")
+        if cb_older:
+            flag(p, "canceled_by_points_to_older_law")
         recs.append({
             "pmk_ID": p, "ModLeg": r.ModLeg, "json_leg_uid": r.json_uid,
             "Leg_Name": name, "name_source": nsrc, "Law_Name_csv_original": r.Law_Name, "_json_name": r.j_name,
@@ -1005,17 +1120,18 @@ def build(cfg: dict, out: Path):
             # Replaced_For gate (CSV side v2.6.0, JSON side v2.6.1). Neither source is trusted blindly:
             # CSV values are evidence only (the column mixes cancellations, newer laws and notes); a JSON value
             # is withheld when it equals Replaced_By or cites only newer laws. Withheld values stay as evidence.
-            "Canceled_By": r.j_canceled_by,
-            "Replaced_By": r.j_replaced_by,
+            "Canceled_By": "" if cb_older else r.j_canceled_by,
+            "Replaced_By": "" if rb_older else r.j_replaced_by,
+            "_raw_canceled_by": r.j_canceled_by, "_raw_replaced_by": r.j_replaced_by,
             "Replaced_For": "" if rf_problem else r.j_replaced_for,
             "Replaced_For_source": "json" if (r.j_replaced_for and not rf_problem) else "",
             "Replaced_For_raw_json": r.j_replaced_for,
             "Replaced_For_raw_csv": r.Replaced_For,
-            "Replaced_For_review": rf_problem or (
+            "Replaced_For_review": triage_replaced_for(rf_problem or (
                 "csv_conflicts_with_json" if r.j_replaced_for and r.Replaced_For and r.j_replaced_for != r.Replaced_For
                 else "csv_only_unapproved" if (not r.j_replaced_for and r.Replaced_For)
                 else ""
-            ),
+            ), r.j_replaced_for, r.Replaced_For, r.j_canceled_by, year),
             "entity": r.entity_final, "parent_ministry": r.parent_ministry, "entity_type": r.type, "scope": r.scope,
             "in_json": r.in_json, "row_origin": r.row_origin,
             "_lvl": r.json_level, "_uid": r.json_uid, "_parent_uid": r.json_parent_uid, "_order": r.json_order,
@@ -1024,9 +1140,9 @@ def build(cfg: dict, out: Path):
         })
     R = pd.DataFrame(recs).set_index("pmk_ID", drop=False)
 
-    # Route every withheld/unapproved Replaced_For value through the existing review mechanism.
+    # Route every withheld/unapproved Replaced_For value that the evidence did not settle to review.
     for p, code in zip(R.pmk_ID, R.Replaced_For_review):
-        if code:
+        if code and not code.startswith("resolved_"):
             flag(p, "replaced_for_" + code)
 
     rep["field_conflicts_csv_vs_json"] = pd.DataFrame(conflicts)
@@ -1557,13 +1673,87 @@ def build(cfg: dict, out: Path):
         "Year": R.at[p, "Year"], "Status": R.at[p, "Status"], "Magazine_Number": R.at[p, "Magazine_Number"],
         "Magazine_Page": R.at[p, "Magazine_Page"], "Magazine_Date": R.at[p, "Magazine_Date"], "in_json": R.at[p, "in_json"],
         "base_pmk_ID": R.at[p, "parent_pmk_ID"]} for p in no_art])
+    # ------------------------------------------------------------------ 7b. dates checked against the law's own text (v2.7.0)
+    # Runs after the sequence step, so parent scoring is unchanged. Only a "from publication (+N days)" rule is
+    # applied automatically, and only when the gazette date is the record's own (within a year of its Year):
+    # an Active_Date BEFORE publication contradicts that rule (typically a base law's date copied onto an amendment).
+    def gazette_ok(p):
+        y, gz = as_int(R.at[p, "Year"], 0), R.at[p, "Magazine_Date"]
+        return bool(gz) and y > 0 and abs(as_int(gz[:4], 0) - y) <= 1
+
+    rules = {p: effective_rule(naming_article(art_now(p))) if R.at[p, "articles_check"] in ("ok", "replaced_from_diwan") else None
+             for p in R.pmk_ID}
+    before = dict(zip(R.pmk_ID, R.Active_Date))
+    for p, rule in rules.items():  # pass 1: apply the text where the current value plainly contradicts it
+        gz, act, new = R.at[p, "Magazine_Date"], R.at[p, "Active_Date"], ""
+        if rule and rule[0] == "pub" and gazette_ok(p) and (not act or act < gz or (rule[1] > 0 and act == gz)):
+            # before publication, or the stated delay ignored (measured: 228 agree with gazette+N, 11 equal the gazette date)
+            new = (date.fromisoformat(gz) + timedelta(days=rule[1])).isoformat()
+        elif (rule and rule[0] == "date" and as_int(rule[1][:4], 0) <= as_int(R.at[p, "Year"], 0) + 1
+              and (not act or abs((date.fromisoformat(act) - date.fromisoformat(rule[1])).days) > 3)):
+            # an explicit date in the law itself (measured: 247 of 258 agree); a date years AFTER the law is not trusted
+            new = rule[1]
+        if new:
+            R.at[p, "Active_Date"] = new
+            end = R.at[p, "End_Date"]
+            if end and end < new:
+                flag(p, "end_before_active")
+            elif "end_before_active" in flags[p]:
+                flags[p].remove("end_before_active")
+    date_rows = []
+    for p, rule in rules.items():  # pass 2: compare what is left with the text (parent dates are final now)
+        gz, act, act0 = R.at[p, "Magazine_Date"], R.at[p, "Active_Date"], before[p]
+        far = bool(gz) and as_int(R.at[p, "Year"], 0) > 0 and not gazette_ok(p)
+        if far:
+            flag(p, "gazette_date_far_from_year")
+        kind = rule[0] if rule else ""
+        par = R.at[p, "parent_pmk_ID"]
+        derived = (rule[1] if kind == "date" else
+                   (date.fromisoformat(gz) + timedelta(days=rule[1])).isoformat() if kind == "pub" and gazette_ok(p) else
+                   R.at[par, "Active_Date"] if kind == "base" and par in R.index else "")
+        action = ""
+        if act != act0:
+            action = "fixed_from_article1" if act0 else "filled_from_article1"
+        elif derived and act and abs((date.fromisoformat(act) - date.fromisoformat(derived)).days) > 3:
+            action = "review_active_date_disagrees_with_article1"
+            flag(p, "active_date_disagrees_with_article1")
+        elif derived and not act:
+            action = "review_active_date_missing"
+            flag(p, "active_date_missing_article1_gives_it")
+        elif not rule and act and gz and (date.fromisoformat(gz) - date.fromisoformat(act)).days > 365:
+            action = "review_active_date_long_before_publication"
+            flag(p, "active_date_long_before_publication")
+        if action or far:
+            date_rows.append({
+                "pmk_ID": p, "record_type": R.at[p, "record_type"], "Leg_Name": R.at[p, "Leg_Name"],
+                "Leg_Number": R.at[p, "Leg_Number"], "Year": R.at[p, "Year"], "Magazine_Number": R.at[p, "Magazine_Number"],
+                "Magazine_Date": gz, "gazette_far_from_year": far, "Active_Date_before": act0, "Active_Date_after": act,
+                "article1_rule": {"pub": f"publication+{rule[1]}d" if rule else "", "date": f"explicit {rule[1] if rule else ''}",
+                                  "base": "from the original law's date", "retro": "retroactive (start of year/month)"}.get(kind, ""),
+                "article1_date": derived, "parent_pmk_ID": par, "action": action or "review_gazette_date"})
+    rep["dates_checked_against_article1"] = pd.DataFrame(date_rows)
+    log.info("Active_Date vs article 1: %s | gazette dates far from Year: %d",
+             json.dumps(pd.Series([r["action"] for r in date_rows]).value_counts().to_dict()),
+             sum(r["gazette_far_from_year"] for r in date_rows))
+
     rep["csv_rows_not_in_json"] = R[~R.in_json][["pmk_ID", "ModLeg", "Leg_Name", "Leg_Number", "Year", "record_type", "chain_id", "row_origin"]]
     rep["replaced_for_review"] = pd.DataFrame([{
         "pmk_ID": p, "record_type": r.record_type, "Leg_Name": r.Leg_Name, "Leg_Number": r.Leg_Number, "Year": r.Year,
-        "review": r.Replaced_For_review, "canonical_Replaced_For": r.Replaced_For,
+        "review": r.Replaced_For_review,
+        "status": "auto_resolved" if r.Replaced_For_review.startswith("resolved_") else "needs_person",
+        "suggestion": "" if r.Replaced_For_review.startswith("resolved_") else
+        "belongs_to_Canceled_By" if is_cancellation(r.Replaced_For_raw_csv) else
+        "candidate_predecessor" if cites(r.Replaced_For_raw_csv, r.Year) == "older_only" else "",
+        "canonical_Replaced_For": r.Replaced_For,
         "json_Replaced_For": r.Replaced_For_raw_json, "json_cites": cites(r.Replaced_For_raw_json, r.Year),
-        "json_Replaced_By": r.Replaced_By, "csv_Replaced_For": r.Replaced_For_raw_csv,
-        "csv_cites": cites(r.Replaced_For_raw_csv, r.Year)} for p, r in R[R.Replaced_For_review != ""].iterrows()])
+        "json_Replaced_By": r._raw_replaced_by, "json_Canceled_By": r._raw_canceled_by,
+        "csv_Replaced_For": r.Replaced_For_raw_csv, "csv_cites": cites(r.Replaced_For_raw_csv, r.Year)}
+        for p, r in R[R.Replaced_For_review != ""].iterrows()])
+    rep["successor_relations_withheld"] = pd.DataFrame([{
+        "pmk_ID": p, "record_type": r.record_type, "Leg_Name": r.Leg_Name, "Leg_Number": r.Leg_Number, "Year": r.Year,
+        "field": f, "json_value": raw, "cites": cites(raw, r.Year)}
+        for p, r in R.iterrows() for f, raw, kept in (("Replaced_By", r._raw_replaced_by, r.Replaced_By),
+                                                      ("Canceled_By", r._raw_canceled_by, r.Canceled_By)) if raw and not kept])
 
     # ------------------------------------------------------------------ 8. write JSON (same record structure)
     # v2.6.1: the JSON gets the same corrected values as the KG CSV (written only where they differ)
@@ -1580,11 +1770,12 @@ def build(cfg: dict, out: Path):
                 json_fixes.append({"pmk_ID": p, "json_leg_uid": R.at[p, "_uid"], "field": field,
                                    "json_before": rec.get(field), "json_after": fmt(new)})
                 rec[field] = fmt(new)
-        if (rec.get("Replaced_For") or "") != R.at[p, "Replaced_For"]:  # only a withheld JSON value differs
-            json_fixes.append({"pmk_ID": p, "json_leg_uid": R.at[p, "_uid"], "field": "Replaced_For",
-                               "json_before": rec.get("Replaced_For"), "json_after": R.at[p, "Replaced_For"],
-                               "reason": R.at[p, "Replaced_For_review"]})
-            rec["Replaced_For"] = R.at[p, "Replaced_For"]
+        for field, why in (("Replaced_For", R.at[p, "Replaced_For_review"]),
+                           ("Replaced_By", "replaced_by_points_to_older_law"), ("Canceled_By", "canceled_by_points_to_older_law")):
+            if (rec.get(field) or "") != R.at[p, field]:  # only a withheld JSON value differs
+                json_fixes.append({"pmk_ID": p, "json_leg_uid": R.at[p, "_uid"], "field": field,
+                                   "json_before": rec.get(field), "json_after": R.at[p, field], "reason": why})
+                rec[field] = R.at[p, field]
         rec["Status"] = R.at[p, "Status"]
         if R.at[p, "End_Date"] and not rec.get("End_Date"):
             rec["End_Date"] = to_json_date(R.at[p, "End_Date"])
@@ -1662,7 +1853,8 @@ def build(cfg: dict, out: Path):
     text = lambda v: str(v or "")  # noqa: E731
     shared = [("Leg_Name", text), ("Status", text), ("Leg_Number", clean_num), ("Year", lambda v: str(v or "").strip()),
               ("Magazine_Number", clean_num), ("Magazine_Page", clean_num), ("Magazine_Date", to_iso),
-              ("Active_Date", to_iso), ("End_Date", to_iso), ("Replaced_For", text)]
+              ("Active_Date", to_iso), ("End_Date", to_iso), ("Replaced_For", text), ("Replaced_By", text),
+              ("Canceled_By", text)]
     mism = [{"pmk_ID": r.pmk_ID, "json_leg_uid": r.json_leg_uid, "field": f, "kg": r[f], "json": out_recs[r.json_leg_uid].get(f)}
             for _, r in final.iterrows() if r.json_leg_uid in out_recs
             for f, norm in shared if norm(out_recs[r.json_leg_uid].get(f)) != norm(r[f])]
