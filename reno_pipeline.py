@@ -2,6 +2,22 @@
 reno_pipeline.py — v2.4.0  (project: reno)
 Produces a clean, knowledge-graph-ready laws CSV + a corrected master JSON + review/volunteer files.
 
+v2.5.0 (evidence: pmk 6038 قانون معدل لقانون الجنسية 1948, pmk 6056; full-corpus before/after diff):
+  - ONE deterministic target resolver (resolve_targets) for every path - targets, new-text probes,
+    operations - replacing a digits-only regex that silently missed: numbers written as words
+    ("المادة السابعة", "الحادية والعشرون"), a base law cited by name ("من قانون الجنسية لسنة 1928",
+    checked against the base law's name), "(3 - و)", "(54 مكررة)", "المادة5", lists closed by "منه".
+  - operative articles are found by CONTENT (operation verb, not the naming clause), no longer by
+    position: article 1 was always skipped, and in old laws it is often the only real change.
+  - no more arbitrary fallback: an unresolved target is sent to a volunteer as
+    "target_article_unresolved" / "amendment_has_no_operative_text" instead of "the first 5 changed
+    articles"; each target now carries its evidence (clause, how matched, confirmed by the new text's
+    own number) through build_queues to the portal.
+  - result on 1849 amendments: 1448 -> 1709 with identified targets; rows_out unchanged (4396);
+    the 18 target ids no longer produced were each inspected: mentions inside the new wording
+    ("المادة 33 من هذا القانون"), other laws, quoted text, own headings, or ambiguous renumbering.
+    6038 and 1555 left the queue after content verification (new wording present in the snapshot);
+    4 new queue entries (targets now found whose snapshot article never changed) are real checks.
 v2.4.0 (evidence: pmk 3219 قانون الإعسار, corpus-wide scan, see code comments where noted):
   - parse_amended_articles: dropped the "منه/منها" ("...of it") fallback whenever the referenced
     number is also one of the amendment's own article numbers - it was a self-reference, not a
@@ -58,7 +74,7 @@ try:
 except ImportError:  # pipeline still runs; those cases stay in the volunteer queue
     MANUAL_REFLECTIONS = {}
 
-VERSION = "2.3.1"
+VERSION = "2.5.0"
 TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 log = logging.getLogger("reno_pipeline")
 ISSUE_DATES: dict = {}
@@ -190,26 +206,147 @@ def articles_check(articles: list[dict], names: list[str]) -> tuple[str, float]:
     return ("ok" if score >= 0.5 else "articles_title_mismatch"), round(score, 2)
 
 
-def parse_amended_articles(articles: list[dict]) -> list[str]:
-    """Article numbers of the ORIGINAL law this amendment touches (article 1 excluded).
-    'منه/منها' alone ("...of it") is ambiguous when the amending record is itself a long,
-    full-text replacement law (e.g. قانون الإعسار, pmk 3219, 142 articles): its own article 92
-    says "المادة (91) منه", referring to ITS OWN article 91, not the base law's. Verified on the
-    full corpus (v2.4.0): that weak "منه/منها" evidence is dropped whenever the referenced number
-    also happens to be one of this amendment's own article numbers (self-reference is far more
-    likely then); this changes 6 of 1499 amendments corpus-wide, all from a wrong single guess to
-    an honest 'no confident target', none from a previously-correct guess."""
+# ----------------------------------------------------------------------------- target resolver (v2.5.0)
+# ONE deterministic resolver for "which article(s) of the BASE law does this amendment touch?",
+# used by every path (targets, new-text probes, operations) so they can never disagree again.
+# Replaces three silent failures proven on pmk 6038 (قانون معدل لقانون الجنسية 1948):
+#   1) numbers written as words ("المادة السابعة") were invisible to the digits-only ART_REF;
+#   2) a base law cited by NAME ("من قانون الجنسية لسنة 1928") was not accepted - only the
+#      literal "القانون الأصلي"/"منه" were;
+#   3) article 1 was always skipped by POSITION as "the naming clause" - in old laws it is often the
+#      operative article (6038's only real change was in its article 1).
+# Every accepted target carries its evidence (the clause + how the base law was identified), and a
+# target is "confirmed" when the replacement text itself starts with the same number ("7. يجوز").
+_AN = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي", "ة": "ه", "ـ": ""})
+_UNITS = {"الاولي": 1, "الحاديه": 1, "الثانيه": 2, "الثالثه": 3, "الرابعه": 4, "الخامسه": 5, "السادسه": 6,
+          "السابعه": 7, "الثامنه": 8, "التاسعه": 9, "العاشره": 10}
+_TENS = {"العشرين": 20, "العشرون": 20, "الثلاثين": 30, "الثلاثون": 30, "الاربعين": 40, "الاربعون": 40,
+         "الخمسين": 50, "الخمسون": 50, "الستين": 60, "الستون": 60, "السبعين": 70, "السبعون": 70,
+         "الثمانين": 80, "الثمانون": 80, "التسعين": 90, "التسعون": 90, "المائه": 100, "المئه": 100}
+ARTWORD = re.compile(r"(?:ال)?(?:ماده|مادتين|مادتان|مواد)(?=[\s(\d])")
+HEADING = re.compile(r"(?:^|\n)\s*[-–]?\s*(?:ال)?ماده\s*\(?\s*(\d{1,4})\s*\)?\s*[:\-–]")
+OP_VERB = re.compile(r"(?<![\w])[وف]?(?:تعدل|يعدل|تلغي|يلغي|تضاف|يضاف|يستعاض|تستبدل|يستبدل|تحذف|يحذف|تشطب|يشطب|يعاد)(?![\w])")
+LAW_WORD = re.compile(r"^\s*من\s+(?:ال)?(?:قانون|نظام|ذيل|قرار|لائحه)\s*(.{0,120})")
+NEW_T_N = re.compile(r"(?:(?:كما|بما)\s+(?:يلي|ياتي)|(?:بال|علي\s+ال)(?:نص|صوره|نحو)\s+(?:التالي|الاتي|التاليه|الاتيه)|كالاتي|كالتالي)[^:\n]{0,40}[:.]?\s*")
+NAMING = re.compile(r"يسمي\s+هذا\s+(?:القانون|النظام|الذيل|التعديل|القرار)")
+BASE_ALIAS = re.compile(r"^\s*(?:من\s+)?(?:القانون\s+(?:الاصلي|الرئيسي)|النظام\s+الاصلي|منه|منها|من\s+(?:\S+\s+){1,4}?(?:الانف|المذكور|المشار))")
+
+
+def _ar(s: str) -> str:
+    return AR_DIAC.sub("", str(s)).translate(_AN)
+
+
+def _read_number(t: str, i: int) -> tuple[int | None, int]:
+    """Read one article number at t[i:] - digits or an Arabic ordinal (1..199) - plus an optional
+    sub-clause marker like '(3 - و)' / '(3/أ)'. Returns (number, end_index) or (None, i)."""
+    m = re.match(r"\s*\(?\s*(\d{1,4})\s*(?:[-/]\s*[ا-ي]\s*)?(?:مكرر[هة]?(?:\s+[^\s()]+)?\s*)?\)?", t[i:])
+    if m:
+        return int(m.group(1)), i + m.end()
+    m = re.match(r"\s*([^\s()]+)(?:\s+(عشره|عشر))?(?:\s+و\s?([^\s()]+))?", t[i:])
+    if not m:
+        return None, i
+    w1, teen, w2 = m.group(1), m.group(2), m.group(3)
+    if w1 in _UNITS and (w1 != "الحاديه" or teen or w2):
+        n, end = _UNITS[w1], m.end(1)
+        if teen:
+            n, end = n + 10, m.end(2)
+        elif w2 and ("ال" + w2.removeprefix("ال")) in _TENS:
+            n, end = n + _TENS["ال" + w2.removeprefix("ال")], m.end(3)
+        return n, i + end
+    if w1 in _TENS:
+        return _TENS[w1], i + m.end(1)
+    return None, i
+
+
+def operative(articles: list[dict]) -> list[dict]:
+    """The amendment's own articles that actually change something (by CONTENT, not position):
+    has an operation verb and is not the naming clause. Enforcement/execution clauses drop out."""
+    out = []
+    for a in articles:
+        t = _ar(a.get("text", ""))
+        if NAMING.search(t[:150]):
+            continue
+        if OP_VERB.search(t) or STRICT_ORIGINAL_LAW.search(t):
+            out.append(a)
+    return out
+
+
+def resolve_targets(text: str, own_nums: set[str], base_names: list[str] | None) -> list[dict]:
+    """Base-law articles referenced by one operative clause, each with its evidence.
+    base_names=None -> accept any "من قانون ..." (the operations engine's historical behaviour)."""
+    t = _ar(text)
+    base_core = set().union(*(core(n) for n in base_names)) if base_names else set()
+    out, seen, pending = [], set(), []
+    for m in ARTWORD.finditer(t):
+        nums, j = [], m.end()
+        n, j2 = _read_number(t, j)
+        while n is not None:
+            nums.append(n)
+            j = j2
+            sep = re.match(r"\s*(?:،|,|و)\s*", t[j:])
+            if not sep:
+                break
+            n, j2 = _read_number(t, j + sep.end())
+        if not nums:
+            continue
+        tail = t[j: j + 160]
+        nxt = ARTWORD.search(tail)
+        near = tail[: min(90, nxt.start() if nxt else 90)]   # up to the next article mention
+        law = LAW_WORD.match(tail)
+        if BASE_ALIAS.match(tail) or re.search(r"القانون\s+(?:الاصلي|الرئيسي)|الوارد\w*\s+(?:فيه|فيها)(?!\w)|(?<!\w)(?:اليه|اليها)(?!\w)"
+                                              r"|^\s*من\s+القانون(?=\s+(?:حسبما|كما|وتعديلاته)|\s*[.,،:)])", near):
+            via = "القانون الأصلي/منه"
+            if "منه" in tail[:8] and not STRICT_ORIGINAL_LAW.search(tail) and any(str(x) in own_nums for x in nums):
+                continue  # self-reference guard (v2.4.0, pmk 3219)
+        elif law:
+            cited = core(re.split(r"\s(?:لسنه|رقم|كما|بما|علي|بال|الواقعه|المؤرخ)(?!\w)|[:\n(]", law.group(1))[0])
+            if base_names is not None and (not cited or len(cited & base_core) / len(cited) < 0.5):
+                pending = []
+                continue  # an article of ANOTHER law - never a target
+            via = "اسم القانون الأصلي"
+        elif OP_VERB.search(t[max(0, m.start() - 25): m.start()]) and not re.search(r"قانون|نظام|ذيل|قرار", tail[:60]):
+            via = "سياق التعديل (دون ذكر القانون)"
+        else:
+            pending.append((nums, m.start()))  # may be part of a list closed by "... منه"
+            continue
+        for pn, ps in pending:  # same sentence, no break before this base-resolved mention
+            if not re.search(r"[.:\n]", t[ps: m.start()]):
+                for x in pn:
+                    if str(x) not in seen:
+                        seen.add(str(x))
+                        out.append({"n": str(x), "via": "ضمن قائمة مواد تنتهي بذكر القانون الأصلي",
+                                    "clause": str(text).strip()[:700], "confirmed": False})
+        pending = []
+        body = NEW_T_N.search(t[j:])
+        lead = re.match(r"\s*[-–]*\s*\(?\s*(\d{1,4})\s*\)?\s*(?:[.\-–:]|\s)", t[j + body.end():]) if body else None
+        for x in nums:
+            if str(x) not in seen:
+                seen.add(str(x))
+                out.append({"n": str(x), "via": via, "clause": str(text).strip()[:700],
+                            "confirmed": bool(lead and int(lead.group(1)) == x)})
+    # an operative clause that writes out new article text: its "المادة N :" headings are base-law
+    # articles being (re)written, even when the instruction line itself names no number
+    for h in HEADING.finditer(t):
+        if h.group(1) not in seen and OP_VERB.search(t[: h.start()]):
+            seen.add(h.group(1))
+            out.append({"n": h.group(1), "via": "عنوان مادة في النص الجديد", "clause": str(text).strip()[:700], "confirmed": True})
+    return out
+
+
+def parse_amended_articles(articles: list[dict], base_names: list[str] | None = None) -> list[str]:
+    """Article numbers of the ORIGINAL law this amendment touches (see resolve_targets)."""
+    return [d["n"] for d in target_evidence(articles, base_names)]
+
+
+def target_evidence(articles: list[dict], base_names: list[str] | None = None) -> list[dict]:
     own_nums = {str(a.get("article_number", "")).strip() for a in articles}
-    found: set[str] = set()
-    for a in articles[1:]:
-        t = str(a.get("text", ""))
-        for m in ART_REF.finditer(t):
-            tail, num = t[m.end(): m.end() + 90], m.group(1)
-            if STRICT_ORIGINAL_LAW.search(tail):
-                found.add(num)
-            elif LOOSE_ORIGINAL_LAW.search(tail) and num not in own_nums:
-                found.add(num)
-    return sorted(found, key=as_int)
+    ev, seen = [], set()
+    for a in operative(articles):
+        for d in resolve_targets(a.get("text", ""), own_nums, base_names):
+            if d["n"] not in seen:
+                seen.add(d["n"])
+                ev.append(d)
+    return sorted(ev, key=lambda d: as_int(d["n"]))
 
 
 def art_map(lst) -> dict[str, str]:
@@ -248,7 +385,7 @@ ART_HEAD = re.compile(r"^\s*(?:ال)?ماد[ةه]\s*\(?\s*\d+\s*(?:مكرر[ةه
 def new_text_blocks(articles: list[dict]) -> list[list[str]]:
     """Replacement/added wording an amendment introduces, as a few squashed probes per block."""
     out = []
-    for a in articles[1:]:
+    for a in operative(articles):
         t = str(a.get("text", ""))
         for m in NEW_TEXT.finditer(t):
             seg = t[m.end():]
@@ -308,10 +445,14 @@ def find_all(text: str, phrase: str) -> list:
 def instructions(own: list[dict]) -> list[tuple[str, str]]:
     """(target_article, instruction_text) for each operative article of the amendment."""
     out = []
-    for a in own[1:]:
+    for a in operative(own):
         t = SIGN.sub("", str(a.get("text", "")))
-        m = TARGET.search(t)
-        out.append((art_num(m.group(1)) if m else "", t))
+        ts = resolve_targets(t, set(), None)
+        if ts:
+            out.append((ts[0]["n"], t))
+        else:
+            m = TARGET.search(t)
+            out.append((art_num(m.group(1)) if m else "", t))
     return out
 
 
@@ -1084,7 +1225,9 @@ def build(cfg: dict, out: Path):
                 continue
             rec = FULL[u]
             own = art_now(p)
-            amended = parse_amended_articles(own)
+            base_names = [R.at[cid, "Leg_Name"], R.at[p, "Leg_Name"]] if cid in R.index else None
+            tev = target_evidence(own, base_names)
+            amended = [d["n"] for d in tev]
             R.at[p, "amended_articles"] = "|".join(amended)
             has = bool(R.at[p, "_has_refl"])
             R.at[p, "has_reflection"] = has
@@ -1228,12 +1371,17 @@ def build(cfg: dict, out: Path):
                                   "Leg_Name": R.at[p, "Leg_Name"], "amended_articles": "|".join(amended),
                                   "changed_articles": "|".join(sorted(changed, key=as_int)), "check": chk})
                 if chk not in ("ok", "fixed_article1_ok") and not chk.startswith("resolved_"):
-                    targets = amended or sorted(changed, key=as_int)[:5]
+                    # v2.5.0: no arbitrary fallback. The old "first 5 changed articles" showed volunteers
+                    # articles unrelated to the amendment (pmk 6056 -> 1..5 while it only touches art. 3).
+                    targets = amended
+                    if not targets:
+                        chk = "target_article_unresolved" if operative(own) else "amendment_has_no_operative_text"
                     vol_rows.append({
                         "pmk_ID": p, "amendment_name": R.at[p, "Leg_Name"], "base_pmk_ID": cid,
                         "base_name": R.at[cid, "Leg_Name"] if cid in R.index else "", "position_in_chain": R.at[p, "chain_position"],
                         "problem": chk, "reviewer_note": manual_notes.get(p, ""), "articles_to_check": "|".join(targets),
-                        "amendment_text": "\n".join(f"[{a.get('article_number')}] {a.get('text', '')}" for a in own[1:])[:6000],
+                        "amendment_text": "\n".join(f"[{a.get('article_number')}] {a.get('text', '')}" for a in own)[:6000],
+                        "target_evidence": json.dumps([d for d in tev if d["n"] in targets], ensure_ascii=False),
                         "previous_version_of_articles": "\n".join(f"[{k}] {prev_raw[k].get('text', '')}" for k in targets if k in prev_raw)[:6000],
                         "current_snapshot_of_articles": "\n".join(f"[{k}] {snap_raw[k].get('text', '')}" for k in targets if k in snap_raw)[:6000],
                     })
@@ -1243,7 +1391,7 @@ def build(cfg: dict, out: Path):
                                  "base_name": R.at[cid, "Leg_Name"] if cid in R.index else "",
                                  "position_in_chain": R.at[p, "chain_position"], "problem": chk,
                                  "articles_to_check": "|".join(amended),
-                                 "amendment_text": "\n".join(f"[{a.get('article_number')}] {a.get('text', '')}" for a in own[1:])[:6000],
+                                 "amendment_text": "\n".join(f"[{a.get('article_number')}] {a.get('text', '')}" for a in own)[:6000],
                                  "previous_version_of_articles": "", "current_snapshot_of_articles": ""})
             R.at[p, "reflection_check"] = chk
             if chk not in ("ok", "fixed_article1_ok") and not chk.startswith("resolved_"):

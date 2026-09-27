@@ -1,7 +1,9 @@
 """
-build_queues.py — v1.1.0  (project: reno, volunteer portal, phase 1)
+build_queues.py — v1.2.0  (project: reno, volunteer portal, phase 1)
 Turns the reno outputs into self-contained volunteer tasks, split between the volunteers.
 
+v1.2.0: reflection tasks carry per-article evidence (clause / how the base law was identified / confirmed)
+        from reno_pipeline v2.5.0, so the portal shows the exact amendment clause instead of re-guessing it.
 v1.1.0: task_id is now a stable hash of (queue, pmk_ID), not a running counter - see the comment
 above the task_id line for why (a rerun that removes/reorders one row used to reassign every
 later task_id in that queue to a different law).
@@ -33,7 +35,7 @@ from pathlib import Path
 
 import pandas as pd
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 log = logging.getLogger("build_queues")
 MAX_FIELD = 60000  # per text field
@@ -124,11 +126,16 @@ def build(run: Path, users: list[str], refl_users: list[str], out: Path) -> pd.D
         own = rec(p).get("Base_Articles") or []
         prev, snap = previous_version(p), arts(rec(p).get("Reflected_Articles"))
         targets = [a for a in r.articles_to_check.split("|") if a] or []
+        # v1.2.0: per-target evidence from reno_pipeline v2.5.0 (the exact clause that names the article,
+        # how the base law was identified, whether the new text's own number confirms it)
+        ev = {d["n"]: d for d in json.loads(r.get("target_evidence", "") or "[]")}
         payload = {
             **meta(p),
             "problem": r.problem, "reviewer_note": r.reviewer_note,
             "amendment_articles": [{"n": str(a.get("article_number", "")), "text": cut(a.get("text", ""))} for a in own],
-            "articles": [{"n": n, "previous": cut(prev.get(n, "")), "current": cut(snap.get(n, ""))} for n in targets],
+            "articles": [{"n": n, "previous": cut(prev.get(n, "")), "current": cut(snap.get(n, "")),
+                          "clause": cut(ev.get(n, {}).get("clause", "")), "via": ev.get(n, {}).get("via", ""),
+                          "confirmed": bool(ev.get(n, {}).get("confirmed"))} for n in targets],
             "position_in_chain": r.position_in_chain,
         }
         tasks.append({"queue": "reflection", "pmk_ID": p, "title": r.amendment_name, "payload": payload})

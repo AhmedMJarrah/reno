@@ -1,5 +1,5 @@
 """
-portal_app.py — v1.3.1  (project: reno, volunteer portal, phase 1)
+portal_app.py — v1.3.2  (project: reno, volunteer portal, phase 1)
 One Streamlit app, role-based: volunteers (v1..v5) see only their own tasks; the admin sees progress,
 reassigns tasks and reads the answers. Backend: Google Sheets through sheets_store.py.
 
@@ -62,7 +62,7 @@ import streamlit as st
 from guides import guide
 from sheets_store import STATUSES, Store
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 QUEUES = {"reflection": "الانعكاسات", "end_date": "تاريخ انتهاء السريان",
           "number_year": "رقم وسنة التشريع", "articles": "المواد الناقصة"}
 QUEUE_ICONS = {"reflection": "🔄", "end_date": "📅", "number_year": "🔢", "articles": "📄"}
@@ -71,7 +71,10 @@ PROBLEMS = {"new_text_missing_in_snapshot": "النص الجديد الذي جا
             "amended_articles_unchanged_in_snapshot": "المواد التي يذكرها التعديل لم تتغير في النسخة الحالية",
             "snapshot_may_belong_to_other_law": "النسخة الحالية قد تكون نص قانون آخر",
             "redo_amendment_text_was_wrong": "نص التعديل كان خطأ واستُبدل من الديوان؛ يلزم إعادة الانعكاس",
-            "range_repeal_has_exceptions": "التعديل يلغي مجموعة مواد دفعة واحدة، وبعضها ما زال يظهر بنص عندنا"}
+            "range_repeal_has_exceptions": "التعديل يلغي مجموعة مواد دفعة واحدة، وبعضها ما زال يظهر بنص عندنا",
+            "target_article_unresolved": "لم يتمكن النظام من تحديد المادة التي يعدّلها هذا التعديل بثقة",
+            "amendment_has_no_operative_text": "نص التعديل المخزّن لا يحتوي أي مادة تُجري تغييراً (قد يكون ناقصاً)"}
+VIA_AR = {"confirmed": "✔️ مؤكَّد: النص الجديد يبدأ برقم المادة نفسه"}
 V_REFL = {"ok": "الانعكاس سليم", "fixed": "صححت النص", "undecided": "لا أستطيع الحسم"}
 V_END = {"dated": "غير ساري – حددت تاريخ انتهاء السريان", "active": "التشريع ساري فعلاً (الحالة خطأ)", "undecided": "لا أستطيع الحسم"}
 V_ROW = {"correct": "صحيح", "wrong": "خطأ – أكتب الصحيح", "duplicate": "مكرر لسجل آخر في المجموعة", "undecided": "لا أستطيع الحسم"}
@@ -394,17 +397,26 @@ def form_reflection(task, p, prev):
     k_extra = f"extra_{task.task_id}"
     if k_extra not in st.session_state:
         st.session_state[k_extra] = [a for a in prev.get("articles", []) if a.get("added")]
-    arts = [{"n": a["n"], "previous": a["previous"], "current": a["current"], "added": False} for a in p.get("articles", [])]
+    if not p.get("articles"):
+        st.info("🔎 لا توجد مادة محددة لهذه المهمة. اقرأ نص التعديل أعلاه وحدد بنفسك: أي مادة من القانون الأصلي يغيّرها؟ "
+                "إن وجدتها أضفها بزر «إضافة مادة» أدناه واكتب نصها الصحيح، وإن لم تستطع اختر «لا أستطيع الحسم» مع ذكر السبب.")
+    arts = [{"n": a["n"], "previous": a["previous"], "current": a["current"], "added": False, "clause": a.get("clause", ""),
+             "via": a.get("via", ""), "confirmed": a.get("confirmed", False)} for a in p.get("articles", [])]
     arts += [{"n": a["n"], "previous": "", "current": "", "added": True} for a in st.session_state[k_extra]]
     saved = {a["n"]: a for a in prev.get("articles", [])}
     out = []
     for i, a in enumerate(arts):
         with tint_box(f"art_{task.task_id}_{i}", i):
             article_badge(a["n"], i, " (مادة مضافة)" if a["added"] else "")
-            pat = re.compile(rf"الماد(?:ة|تين|تان|ه)\s*\(?\s*{re.escape(str(a['n']))}\s*\)?")
-            hits = [x["text"] for x in amend if pat.search(x.get("text", ""))]
-            if hits:
-                st.info("📌 ما يطلبه نص التعديل بخصوص هذه المادة: " + " — ".join(hits))
+            if a.get("clause"):  # exact clause + how it was matched, from the pipeline (v1.3.2)
+                st.info(f"📌 ما يطلبه نص التعديل بخصوص هذه المادة: {a['clause']}")
+                st.caption(f"كيف رُبطت هذه المادة بالتعديل: {a.get('via', '')}"
+                           + (f" · {VIA_AR['confirmed']}" if a.get("confirmed") else ""))
+            else:  # older payloads without evidence
+                pat = re.compile(rf"الماد(?:ة|تين|تان|ه)\s*\(?\s*{re.escape(str(a['n']))}\s*\)?")
+                hits = [x["text"] for x in amend if pat.search(x.get("text", ""))]
+                if hits:
+                    st.info("📌 ما يطلبه نص التعديل بخصوص هذه المادة: " + " — ".join(hits))
             prev_diff, curr_diff = diff_spans(a["previous"], a["current"])
             c1, c2, c3 = st.columns(3)
             with c1:
