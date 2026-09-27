@@ -1,7 +1,32 @@
 """
-reno_pipeline.py — v2.4.0  (project: reno)
+reno_pipeline.py — v2.6.1  (project: reno)
 Produces a clean, knowledge-graph-ready laws CSV + a corrected master JSON + review/volunteer files.
 
+v2.6.1 (evidence: content audit of both Replaced_For sources + full before/after diff against v2.6.0, 2026-09-27):
+  - Replaced_For = the OLDER law this record replaced. The JSON side is now checked too: a JSON value is
+    withheld from the canonical output when it is identical to the record's own Replaced_By (a contradiction
+    by definition: 210 JSON records) or cites only laws newer than the record (201, all among those 210).
+    Withheld values stay as evidence (Replaced_For_raw_json) and go to review/replaced_for_review_*.csv.
+  - The CSV Replaced_For column is evidence only, never canonical - an explicit exception to "CSV beats JSON":
+    124 of its 236 values are "ألغي بـ ..." cancellations (mostly the JSON's Canceled_By content), 40 cite newer
+    laws, 6 are notes; only ~66 read as an older law.
+  - master_clean JSON now carries the same corrected metadata as the KG CSV (Leg_Number, Year, Magazine_Number,
+    Magazine_Page, Magazine_Date, Active_Date, Replaced_For). v2.6.0 left the source values in the JSON: the
+    two outputs of one run disagreed on 59 gazette numbers, 37 gazette dates, 9 active dates (JSON empty),
+    2 numbers, 2 years, 1 page. Every JSON field change is listed in review_json_fields_corrected_*.csv.
+  - New final check: every KG row is compared with its JSON record on the shared fields; any disagreement is
+    written to review_kg_json_mismatch_*.csv and the run exits with an error.
+  - Deterministic output: two tie-breaks followed Python's per-run hash order (the "latest same-name base" bonus
+    in parent scoring, and the order of "مكرر" articles in changed_articles), so review_sequence_decisions and
+    review_reflection_checks could differ between two runs on the same input. Ties now go to the stronger
+    evidence, then the lower pmk_ID. Verified: KG CSV and JSON unchanged by this; all 26 output files are
+    identical across hash seeds.
+v2.6.0 (Replaced_For safety gate; evidence from full source audit):
+  - Replaced_For no longer falls back silently from CSV when JSON is blank.
+  - JSON Replaced_For remains authoritative when present.
+  - CSV-only Replaced_For is preserved as raw evidence, flagged for review, and excluded from clean canonical output until approved.
+  - Adds Replaced_For_source, Replaced_For_raw_csv, Replaced_For_review to the KG CSV for provenance.
+  - Existing source JSON is not mutated with unapproved CSV-only replacement relations.
 v2.5.0 (evidence: pmk 6038 قانون معدل لقانون الجنسية 1948, pmk 6056; full-corpus before/after diff):
   - ONE deterministic target resolver (resolve_targets) for every path - targets, new-text probes,
     operations - replacing a digits-only regex that silently missed: numbers written as words
@@ -74,7 +99,7 @@ try:
 except ImportError:  # pipeline still runs; those cases stay in the volunteer queue
     MANUAL_REFLECTIONS = {}
 
-VERSION = "2.5.0"
+VERSION = "2.6.1"
 TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 log = logging.getLogger("reno_pipeline")
 ISSUE_DATES: dict = {}
@@ -129,6 +154,40 @@ def as_int(v, default=10**9) -> int:
         return int(str(v).strip())
     except (TypeError, ValueError):
         return default
+
+
+# ----------------------------------------------------------------------------- Replaced_For checks (v2.6.1)
+YEAR_IN_TEXT = re.compile(r"(?<!\d)(1[89]\d\d|20[0-3]\d)(?!\d)")
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")  # e.g. "قانون الاحزاب السياسية لسنة ٢٠١٥"
+
+
+def cited_years(text: str) -> list[int]:
+    return [int(y) for y in YEAR_IN_TEXT.findall(str(text or "").translate(AR_DIGITS))]
+
+
+def cites(text: str, own_year: str) -> str:
+    """Which way the years cited in a relation point, relative to the record's own year (facts, not a verdict)."""
+    if not str(text or "").strip():
+        return ""
+    ys, y = cited_years(text), as_int(own_year, 0)
+    if not ys or not 1800 <= y <= 2100:
+        return "no_year"
+    if all(v < y for v in ys):
+        return "older_only"
+    if all(v > y for v in ys):
+        return "newer_only"
+    return "same_year" if all(v == y for v in ys) else "mixed"
+
+
+def replaced_for_json_problem(rf: str, rb: str, own_year: str) -> str:
+    """Why a JSON Replaced_For value cannot be canonical ('' = it can). Replaced_For names the OLDER law."""
+    if not str(rf or "").strip():
+        return ""
+    if rb and squash(rf) == squash(rb):
+        return "json_equals_replaced_by"
+    if cites(rf, own_year) == "newer_only":
+        return "json_points_to_later_law"
+    return ""
 
 
 WRAPPER = re.compile(r"^\s*قانون\s+(?:مؤقت\s+)?(?:معدل\s+)?(?:مؤقت\s+)?رقم\s*\d+\s*لسنة\s*\d{4}\s*\((.+)\)\s*(وتعديلاته)?\s*$")
@@ -935,6 +994,7 @@ def build(cfg: dict, out: Path):
             flag(p, "status_inactive_without_end_date")
         if active and end and end < active:
             flag(p, "end_before_active")
+        rf_problem = replaced_for_json_problem(r.j_replaced_for, r.j_replaced_by, year)
         recs.append({
             "pmk_ID": p, "ModLeg": r.ModLeg, "json_leg_uid": r.json_uid,
             "Leg_Name": name, "name_source": nsrc, "Law_Name_csv_original": r.Law_Name, "_json_name": r.j_name,
@@ -942,7 +1002,20 @@ def build(cfg: dict, out: Path):
             "Status": status, "Status_code": {"ساري": "1", "غير ساري": "2"}.get(status, ""), "status_rule": status_rule,
             "Issue_Date": r.j_issue, "Magazine_Number": mag_no, "Magazine_Page": mag_pg, "Magazine_Date": mag_dt,
             "Active_Date": active, "End_Date": end, "Article_Count": r.j_art_count,
-            "Canceled_By": r.j_canceled_by, "Replaced_By": r.j_replaced_by, "Replaced_For": r.j_replaced_for or r.Replaced_For,
+            # Replaced_For gate (CSV side v2.6.0, JSON side v2.6.1). Neither source is trusted blindly:
+            # CSV values are evidence only (the column mixes cancellations, newer laws and notes); a JSON value
+            # is withheld when it equals Replaced_By or cites only newer laws. Withheld values stay as evidence.
+            "Canceled_By": r.j_canceled_by,
+            "Replaced_By": r.j_replaced_by,
+            "Replaced_For": "" if rf_problem else r.j_replaced_for,
+            "Replaced_For_source": "json" if (r.j_replaced_for and not rf_problem) else "",
+            "Replaced_For_raw_json": r.j_replaced_for,
+            "Replaced_For_raw_csv": r.Replaced_For,
+            "Replaced_For_review": rf_problem or (
+                "csv_conflicts_with_json" if r.j_replaced_for and r.Replaced_For and r.j_replaced_for != r.Replaced_For
+                else "csv_only_unapproved" if (not r.j_replaced_for and r.Replaced_For)
+                else ""
+            ),
             "entity": r.entity_final, "parent_ministry": r.parent_ministry, "entity_type": r.type, "scope": r.scope,
             "in_json": r.in_json, "row_origin": r.row_origin,
             "_lvl": r.json_level, "_uid": r.json_uid, "_parent_uid": r.json_parent_uid, "_order": r.json_order,
@@ -950,6 +1023,12 @@ def build(cfg: dict, out: Path):
             "_has_refl": r.j_has_refl, "_nums": {clean_num(r.Law_Number), r.j_number} - {""}, "_years": {cy, jy} - {""},
         })
     R = pd.DataFrame(recs).set_index("pmk_ID", drop=False)
+
+    # Route every withheld/unapproved Replaced_For value through the existing review mechanism.
+    for p, code in zip(R.pmk_ID, R.Replaced_For_review):
+        if code:
+            flag(p, "replaced_for_" + code)
+
     rep["field_conflicts_csv_vs_json"] = pd.DataFrame(conflicts)
     rep["names_diwan_points_to_other_law"] = pd.DataFrame(name_conflicts)
     log.info("Status set to غير ساري by the End_Date rule: %d", (R.status_rule != "").sum())
@@ -1160,7 +1239,8 @@ def build(cfg: dict, out: Path):
         # successive laws with the same name: prefer the latest one in force before the amendment
         same_name = [x for x in scored if "name" in x[2] and "DATE_BEFORE_BASE" not in x[2]]
         if len(same_name) > 1:
-            latest = max(same_name, key=lambda x: date_of(x[1]))
+            # v2.6.1: a date tie goes to the stronger evidence, then the lower pmk_ID (was Python's hash order)
+            latest = max(same_name, key=lambda x: (date_of(x[1]), x[0], -as_int(x[1])))
             scored = [(s + 0.5 if c == latest[1] else s, c, srcs) for s, c, srcs in scored]
         scored.sort(key=lambda x: (-x[0], as_int(x[1])))
         s1, c1, srcs1 = scored[0]
@@ -1369,7 +1449,8 @@ def build(cfg: dict, out: Path):
                         manual_notes[p] = note
                 refl_rows.append({"pmk_ID": p, "chain_id": cid, "position": R.at[p, "chain_position"],
                                   "Leg_Name": R.at[p, "Leg_Name"], "amended_articles": "|".join(amended),
-                                  "changed_articles": "|".join(sorted(changed, key=as_int)), "check": chk})
+                                  "changed_articles": "|".join(sorted(changed, key=lambda a: (as_int(a), a))),  # v2.6.1: stable ties
+                                  "check": chk})
                 if chk not in ("ok", "fixed_article1_ok") and not chk.startswith("resolved_"):
                     # v2.5.0: no arbitrary fallback. The old "first 5 changed articles" showed volunteers
                     # articles unrelated to the amendment (pmk 6056 -> 1..5 while it only touches art. 3).
@@ -1477,10 +1558,33 @@ def build(cfg: dict, out: Path):
         "Magazine_Page": R.at[p, "Magazine_Page"], "Magazine_Date": R.at[p, "Magazine_Date"], "in_json": R.at[p, "in_json"],
         "base_pmk_ID": R.at[p, "parent_pmk_ID"]} for p in no_art])
     rep["csv_rows_not_in_json"] = R[~R.in_json][["pmk_ID", "ModLeg", "Leg_Name", "Leg_Number", "Year", "record_type", "chain_id", "row_origin"]]
+    rep["replaced_for_review"] = pd.DataFrame([{
+        "pmk_ID": p, "record_type": r.record_type, "Leg_Name": r.Leg_Name, "Leg_Number": r.Leg_Number, "Year": r.Year,
+        "review": r.Replaced_For_review, "canonical_Replaced_For": r.Replaced_For,
+        "json_Replaced_For": r.Replaced_For_raw_json, "json_cites": cites(r.Replaced_For_raw_json, r.Year),
+        "json_Replaced_By": r.Replaced_By, "csv_Replaced_For": r.Replaced_For_raw_csv,
+        "csv_cites": cites(r.Replaced_For_raw_csv, r.Year)} for p, r in R[R.Replaced_For_review != ""].iterrows()])
 
     # ------------------------------------------------------------------ 8. write JSON (same record structure)
+    # v2.6.1: the JSON gets the same corrected values as the KG CSV (written only where they differ)
+    same_as_kg = [("Leg_Number", clean_num, str), ("Year", lambda v: str(v or "").strip(), str),
+                  ("Magazine_Number", clean_num, str), ("Magazine_Page", clean_num, str),
+                  ("Magazine_Date", to_iso, to_json_date), ("Active_Date", to_iso, to_json_date)]
+    json_fixes = []
+
     def updated(p, as_nest: bool):
         rec = FULL[R.at[p, "_uid"]]
+        for field, norm, fmt in same_as_kg:
+            new = R.at[p, field]
+            if new and norm(rec.get(field)) != new:
+                json_fixes.append({"pmk_ID": p, "json_leg_uid": R.at[p, "_uid"], "field": field,
+                                   "json_before": rec.get(field), "json_after": fmt(new)})
+                rec[field] = fmt(new)
+        if (rec.get("Replaced_For") or "") != R.at[p, "Replaced_For"]:  # only a withheld JSON value differs
+            json_fixes.append({"pmk_ID": p, "json_leg_uid": R.at[p, "_uid"], "field": "Replaced_For",
+                               "json_before": rec.get("Replaced_For"), "json_after": R.at[p, "Replaced_For"],
+                               "reason": R.at[p, "Replaced_For_review"]})
+            rec["Replaced_For"] = R.at[p, "Replaced_For"]
         rec["Status"] = R.at[p, "Status"]
         if R.at[p, "End_Date"] and not rec.get("End_Date"):
             rec["End_Date"] = to_json_date(R.at[p, "End_Date"])
@@ -1521,6 +1625,7 @@ def build(cfg: dict, out: Path):
         top["Mod_Legs"] = [updated(p, True) for p in seq[1:] if R.at[p, "_uid"]]
         tops.append((as_int(R.at[cid, "_top_idx"], 10**9), as_int(cid), top))
     rep["json_base_records_created"] = pd.DataFrame(created)
+    rep["json_fields_corrected"] = pd.DataFrame(json_fixes)
     new_json = [t for _, _, t in sorted(tops, key=lambda x: (x[0], x[1]))]
     n_out = len(new_json) + sum(len(t["Mod_Legs"]) for t in new_json)
     uids = [t["leg_uid"] for t in new_json] + [m["leg_uid"] for t in new_json for m in t["Mod_Legs"]]
@@ -1545,10 +1650,26 @@ def build(cfg: dict, out: Path):
             "chain_id", "chain_position", "chain_length", "parent_pmk_ID", "prev_pmk_ID", "next_pmk_ID",
             "chain_evidence", "chain_confidence", "articles_check", "articles_source", "has_reflection",
             "amended_articles", "reflection_check", "Canceled_By", "Replaced_By", "Replaced_For",
+            "Replaced_For_source", "Replaced_For_raw_json", "Replaced_For_raw_csv", "Replaced_For_review",
             "entity", "parent_ministry", "entity_type", "scope", "in_json", "needs_review", "review_flags"]
     for p, arts in new_articles.items():
         R.at[p, "Article_Count"] = str(len(arts))
     final = R.sort_values(["chain_id", "chain_position"], key=lambda s: s.map(as_int) if s.name == "chain_id" else s)[cols]
+
+    # ------------------------------------------------------------------ 10. KG CSV <-> JSON consistency (v2.6.1)
+    out_recs = {t["leg_uid"]: t for t in new_json}
+    out_recs.update({m["leg_uid"]: m for t in new_json for m in t["Mod_Legs"]})
+    text = lambda v: str(v or "")  # noqa: E731
+    shared = [("Leg_Name", text), ("Status", text), ("Leg_Number", clean_num), ("Year", lambda v: str(v or "").strip()),
+              ("Magazine_Number", clean_num), ("Magazine_Page", clean_num), ("Magazine_Date", to_iso),
+              ("Active_Date", to_iso), ("End_Date", to_iso), ("Replaced_For", text)]
+    mism = [{"pmk_ID": r.pmk_ID, "json_leg_uid": r.json_leg_uid, "field": f, "kg": r[f], "json": out_recs[r.json_leg_uid].get(f)}
+            for _, r in final.iterrows() if r.json_leg_uid in out_recs
+            for f, norm in shared if norm(out_recs[r.json_leg_uid].get(f)) != norm(r[f])]
+    rep["kg_json_mismatch"] = pd.DataFrame(mism)
+    log.info("KG<->JSON consistency: %d rows checked, %d field mismatches",
+             int(final.json_leg_uid.isin(out_recs).sum()), len(mism))
+
     out.mkdir(parents=True, exist_ok=True)
     final.to_csv(out / f"laws_kg_clean_{TS}.csv", index=False, encoding="utf-8-sig")
 
@@ -1566,6 +1687,9 @@ def build(cfg: dict, out: Path):
     log.info("REFLECTION\n%s", final.reflection_check.value_counts().to_string())
     for k, df in rep.items():
         log.info("report %-40s %6d rows", k, 0 if df is None else len(df))
+    if mism:
+        log.error("KG CSV and JSON disagree on %d fields - see review_kg_json_mismatch_%s.csv", len(mism), TS)
+        raise SystemExit(2)
     return final, new_json, rep
 
 
